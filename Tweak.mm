@@ -144,14 +144,7 @@ typedef void (*ProjectPoint_t)(TA::Vec2 *out, const TA::Vec3 *in);
 static ProjectPoint_t p_ProjectPointToScreen = nullptr;
 
 static void   **p_g_pDynamicObjectSkateboard = nullptr;
-static void   **p_g_pSkateboard              = nullptr;
-static void    *p_g_skater                   = nullptr;
 static void   **p_s_pPhysics                 = nullptr;
-static float   *p_g_fSkateBoardBrightness    = nullptr;
-static uint8_t *p_g_bSkateboardRenderHack    = nullptr;
-static float   *p_g_fSkateboardRenderHackAngle = nullptr;
-static int     *p_g_eCurrentWorld            = nullptr;
-static uint8_t *p_g_pWorldInfo               = nullptr;
 
 // ---------------------------------------------------------------------------
 // Hooks State
@@ -397,7 +390,6 @@ static int g_trailCount = 0;
 // 0: Off, 1: Spinbot 360 (Yaw), 2: HVH Jitter, 3: Helicopter, 4: Chaos Shake
 static int   g_aaMode       = 0;
 static float g_spinbotSpeed = 45.0f;
-static bool  g_spinbotRandom = false;
 
 // 6. Fun Physics & Gravity Hacks
 static bool  g_customGravityEnabled = false;
@@ -602,9 +594,11 @@ static void DrawVisualsAndESP() {
 
                 float progress = (float)i / (float)count;
                 float alpha = progress * 0.75f;
-                float hue = fmodf(s_globalHue + progress * 0.6f, 1.0f);
-                float r, g, b;
-                ImGui::ColorConvertHSVtoRGB(hue, 1.0f, 1.0f, r, g, b);
+                float r = 0.0f, g = 0.95f, b = 1.0f;
+                if (g_trailRainbow) {
+                    float hue = fmodf(s_globalHue + progress * 0.6f, 1.0f);
+                    ImGui::ColorConvertHSVtoRGB(hue, 1.0f, 1.0f, r, g, b);
+                }
 
                 ImU32 ribbonCol = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, alpha));
                 drawList->AddQuadFilled(scNose0, scNose1, scTail1, scTail0, ribbonCol);
@@ -999,16 +993,8 @@ static void InstallHooks() {
 
     p_g_pDynamicObjectSkateboard = (void **)FindSymbol("_g_pDynamicObjectSkateboard");
     gS.dynSkateFound = (p_g_pDynamicObjectSkateboard != nullptr);
-    p_g_pSkateboard              = (void **)FindSymbol("_g_pSkateboard");
-    p_g_skater                   = FindSymbol("_g_skater");
-    p_s_pPhysics                 = (void **)FindSymbol("__ZN2TA7Physics10s_pPhysicsE");
-    gS.physicsFound              = (p_s_pPhysics != nullptr);
-
-    p_g_fSkateBoardBrightness    = (float *)FindSymbol("_g_fSkateBoardBrightness");
-    p_g_bSkateboardRenderHack    = (uint8_t *)FindSymbol("_g_bSkateboardRenderHack");
-    p_g_fSkateboardRenderHackAngle = (float *)FindSymbol("_g_fSkateboardRenderHackAngle");
-    p_g_eCurrentWorld            = (int *)FindSymbol("_g_eCurrentWorld");
-    p_g_pWorldInfo               = (uint8_t *)FindSymbol("_g_pWorldInfo");
+    p_s_pPhysics     = (void **)FindSymbol("__ZN2TA7Physics10s_pPhysicsE");
+    gS.physicsFound  = (p_s_pPhysics != nullptr);
 
     FindGrindThreshold("__ZN4Game25LockTailOrNoseSlideToRailERKN2TA4Vec3Efb");
     FindGrindThreshold("__ZN4Game19LockTailSlideToRailERN2TA4Vec3Eb");
@@ -1137,6 +1123,8 @@ static void DrawMenuWindow() {
                 // Section: Motion Trails (Tron Ribbon)
                 if (ImGui::CollapsingHeader("Rainbow Motion Trail (Tron Ribbon)", ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::Checkbox("Enable Motion Ribbon", &g_trailEnabled);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Rainbow Trail", &g_trailRainbow);
                     ImGui::SliderInt("Trail Length", &g_trailLength, 10, 50);
                     if (ImGui::IsItemActive()) g_sliderActive = true;
                 }

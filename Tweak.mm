@@ -8,6 +8,8 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <mach/mach.h>
+#include <libkern/OSCacheControl.h>
 #include <cxxabi.h>
 #include <substrate.h>
 #include <string>
@@ -206,6 +208,51 @@ static bool AddTrueCredits(int amount) {
     return true;
 }
 
+// --- Auto-grind (code patch) ---
+// The rail-snap gate in Game::LockTail/Nose/OrNoseSlideToRail rejects a lock when an
+// alignment component exceeds 0.99 (built with movz w?,#0x70a4 ; movk w?,#0x3f7d,lsl#16).
+// Raising that threshold to 2.0 (never exceeded) makes the board snap to rails freely.
+// EXPERIMENTAL: if grind gets worse instead, the direction is inverted and we lower it.
+static bool g_autoGrind = true;
+
+struct PatchSite { uint32_t *addr; uint32_t orig; uint32_t patched; };
+static PatchSite g_grindSites[12];
+static int  g_grindSiteCount = 0;
+static bool g_grindFound = false;
+
+static void WriteWord(uint32_t *addr, uint32_t word) {
+    vm_address_t page = (vm_address_t)addr & ~((vm_address_t)vm_page_size - 1);
+    if (vm_protect(mach_task_self(), page, vm_page_size, false,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+        return;
+    *addr = word;
+    vm_protect(mach_task_self(), page, vm_page_size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate(addr, sizeof(uint32_t));
+}
+
+// Find the movz/movk pair that builds 0.99 (0x3f7d70a4) and record a patch -> 2.0 (0x40000000).
+static void FindGrindThreshold(const char *sym) {
+    uint32_t *fn = (uint32_t *)FindSymbol(sym);
+    if (!fn) return;
+    for (int i = 1; i < 0x180 && g_grindSiteCount + 2 <= 12; i++) {
+        uint32_t w = fn[i];
+        if ((w & 0xFFFFFFE0) != 0x72A7EFA0) continue;          // movk w?,#0x3f7d,lsl#16
+        uint32_t rd = w & 0x1F;
+        uint32_t prev = fn[i - 1];
+        if ((prev & 0xFFFFFFE0) != 0x528E1480 || (prev & 0x1F) != rd) continue; // movz w?,#0x70a4
+        uint32_t newMovz = 0x52800000 | rd;                        // movz wRd,#0
+        uint32_t newMovk = 0x72800000 | 0x200000 | (0x4000u << 5) | rd; // movk wRd,#0x4000,lsl#16
+        g_grindSites[g_grindSiteCount++] = { &fn[i - 1], prev, newMovz };
+        g_grindSites[g_grindSiteCount++] = { &fn[i],     w,    newMovk };
+        g_grindFound = true;
+    }
+}
+
+static void ApplyGrind(bool on) {
+    for (int i = 0; i < g_grindSiteCount; i++)
+        WriteWord(g_grindSites[i].addr, on ? g_grindSites[i].patched : g_grindSites[i].orig);
+}
+
 static void InstallHooks() {
     void *a = FindSymbol("__ZN4Game32OverridePhysicsSettingsFromStatsEv");
     gS.physFound = (a != nullptr);
@@ -262,6 +309,11 @@ static void InstallHooks() {
         MSHookFunction(pk, (void *)hook_ParkKey, (void **)&orig_ParkKey);
         gS.parkKeyHook = (orig_ParkKey != nullptr);
     }
+
+    FindGrindThreshold("__ZN4Game25LockTailOrNoseSlideToRailERKN2TA4Vec3Efb");
+    FindGrindThreshold("__ZN4Game19LockTailSlideToRailERN2TA4Vec3Eb");
+    FindGrindThreshold("__ZN4Game19LockNoseSlideToRailERN2TA4Vec3Eb");
+    ApplyGrind(g_autoGrind);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +349,16 @@ static void DrawMenu() {
             ImGui::Separator();
             ImGui::Text("TrueCredits  found:%s hooked:%s add:%s",
                         gS.tcFound ? "y" : "n", gS.tcHooked ? "y" : "n", gS.addTcFound ? "y" : "n");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Grind")) {
+            if (ImGui::Checkbox("Auto-grind (rail stick)", &g_autoGrind))
+                ApplyGrind(g_autoGrind);
+            ImGui::Text("  threshold patch sites: %d", g_grindSiteCount);
+            ImGui::Text("  found: %s", g_grindFound ? "yes" : "NO");
+            ImGui::TextWrapped("EXPERIMENTAL. Raises the rail-snap alignment gate so the board "
+                               "sticks to rails easily. If grind behaves worse, tell me and I "
+                               "flip the value.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Parks")) {

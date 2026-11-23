@@ -31,8 +31,15 @@ struct SymHit {
 
 template <typename Fn>
 static void ForEachSymbol(Fn fn) {
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    const struct mach_header_64 *mh = nullptr;
+    intptr_t slide = 0;
+    uint32_t imgN = _dyld_image_count();
+    for (uint32_t i = 0; i < imgN; i++) {
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (h && h->filetype == MH_EXECUTE) {   // the game binary, not an injected lib
+            mh = h; slide = _dyld_get_image_vmaddr_slide(i); break;
+        }
+    }
     if (!mh) return;
 
     const struct symtab_command *symtab = nullptr;
@@ -104,7 +111,32 @@ static struct {
     bool   addTrickHook = false;  // Game::AddTrick
     bool   trickFlag    = false;  // _g_bTrickWasSlowMo resolved
     bool   notifHook    = false;  // SlowMoNotification_Update
+    bool   parkOwnHook  = false;  // IsParkOwnedAndIfNotShowPopup
+    bool   parkPurHook  = false;  // IsParkPurchased
+    bool   parkKeyHook  = false;  // IsParkUnlockedWithKey
 } gS;
+
+// --- Unlock all parks ---
+// Park select gates playability behind ownership checks. Forcing them true opens
+// every park whose data is present (many ship in the bundle). Parks not yet
+// downloaded will still try to fetch from the server on tap.
+static bool g_unlockParks = true;
+
+static bool (*orig_ParkOwned)(void *self, int idx) = nullptr;
+static bool hook_ParkOwned(void *self, int idx) {
+    if (g_unlockParks) return true;
+    return orig_ParkOwned(self, idx);
+}
+static bool (*orig_ParkPurch)(void *self, int idx) = nullptr;
+static bool hook_ParkPurch(void *self, int idx) {
+    if (g_unlockParks) return true;
+    return orig_ParkPurch(self, idx);
+}
+static bool (*orig_ParkKey)(void *self, int key) = nullptr;
+static bool hook_ParkKey(void *self, int key) {
+    if (g_unlockParks) return true;
+    return orig_ParkKey(self, key);
+}
 
 // --- Slow-motion tweaks ---
 // Score void in slow-mo: Game::AddTrick checks _g_bTrickWasSlowMo and, if set,
@@ -214,6 +246,22 @@ static void InstallHooks() {
         MSHookFunction(sn, (void *)hook_SlowMoNotif, (void **)&orig_SlowMoNotif);
         gS.notifHook = (orig_SlowMoNotif != nullptr);
     }
+
+    void *po = FindSymbol("__ZN17UiFormSkateparksX28IsParkOwnedAndIfNotShowPopupEi");
+    if (po) {
+        MSHookFunction(po, (void *)hook_ParkOwned, (void **)&orig_ParkOwned);
+        gS.parkOwnHook = (orig_ParkOwned != nullptr);
+    }
+    void *pp = FindSymbol("__ZN17UiFormSkateparksX15IsParkPurchasedEi");
+    if (pp) {
+        MSHookFunction(pp, (void *)hook_ParkPurch, (void **)&orig_ParkPurch);
+        gS.parkPurHook = (orig_ParkPurch != nullptr);
+    }
+    void *pk = FindSymbol("__ZN24UserDataManagerTrueSkate21IsParkUnlockedWithKeyEi");
+    if (pk) {
+        MSHookFunction(pk, (void *)hook_ParkKey, (void **)&orig_ParkKey);
+        gS.parkKeyHook = (orig_ParkKey != nullptr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +297,19 @@ static void DrawMenu() {
             ImGui::Separator();
             ImGui::Text("TrueCredits  found:%s hooked:%s add:%s",
                         gS.tcFound ? "y" : "n", gS.tcHooked ? "y" : "n", gS.addTcFound ? "y" : "n");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Parks")) {
+            ImGui::Checkbox("Unlock all parks", &g_unlockParks);
+            ImGui::TextWrapped("Forces park ownership checks to true - no purchase popup, "
+                               "all parks selectable.");
+            ImGui::Text("  owned-gate : %s", gS.parkOwnHook ? "yes" : "NO");
+            ImGui::Text("  purchased  : %s", gS.parkPurHook ? "yes" : "NO");
+            ImGui::Text("  key-unlock : %s", gS.parkKeyHook ? "yes" : "NO");
+            ImGui::Separator();
+            ImGui::TextWrapped("Parks bundled in the app open instantly. A park that was never "
+                               "downloaded will still try to fetch from the server on tap and "
+                               "may fail without a real purchase.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("SlowMo")) {

@@ -323,7 +323,6 @@ static void InstallHooks() {
 // ---------------------------------------------------------------------------
 
 static CGRect gMenuRect = CGRectZero;   // points, updated every frame; used for touch passthrough
-static CGRect gLastMenuRect = CGRectZero;
 
 // Touch scrolling and gesture arbitration state
 static bool    g_isTouching     = false;

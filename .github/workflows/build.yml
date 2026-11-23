@@ -1,0 +1,44 @@
+name: Build deb
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  IMGUI_VERSION: v1.91.5
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: brew install ldid dpkg make
+
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Install iOS SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$HOME/sdks"
+          cd "$HOME/sdks"
+          git sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$HOME/theos/sdks"
+          mv iPhoneOS16.5.sdk "$HOME/theos/sdks/"
+
+      - name: Fetch ImGui
+        run: |
+          mkdir -p vendor
+          git clone --depth 1 --branch "$IMGUI_VERSION" https://github.com/ocornut/imgui.git vendor/imgui
+
+      - name: Build
+        run: gmake package FINALPACKAGE=1
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrueSkateMenu-deb
+          path: packages/*.deb

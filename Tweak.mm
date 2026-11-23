@@ -145,6 +145,8 @@ static ProjectPoint_t p_ProjectPointToScreen = nullptr;
 
 static void   **p_g_pDynamicObjectSkateboard = nullptr;
 static void   **p_g_pSkateboard              = nullptr;
+static void    *p_g_skater                   = nullptr;
+static void   **p_s_pPhysics                 = nullptr;
 static float   *p_g_fSkateBoardBrightness    = nullptr;
 static uint8_t *p_g_bSkateboardRenderHack    = nullptr;
 static float   *p_g_fSkateboardRenderHackAngle = nullptr;
@@ -173,6 +175,7 @@ static struct {
     bool camHooked     = false;   // Camera::SetViewParameters
     bool skyHooked     = false;   // SkyHemiCube::Render
     bool dynSkateFound = false;   // _g_pDynamicObjectSkateboard
+    bool physicsFound  = false;   // TA::Physics::s_pPhysics
 } gS;
 
 // --- Unlock all parks ---
@@ -226,10 +229,14 @@ static bool hook_IsCurSub(void *self, const char *id) {
     return orig_IsCurSub(self, id);
 }
 
+// Forward declare physics updater
+static void UpdatePhysicsModulations();
+
 static void (*orig_OverridePhysics)(void *self) = nullptr;
 static void hook_OverridePhysics(void *self) {
     gS.physCalls++;
     orig_OverridePhysics(self);
+    UpdatePhysicsModulations();
 }
 
 // --- Currency (TrueCredits) ---
@@ -336,10 +343,10 @@ static void hook_SkyHemiCube_Render(void *self) {
 }
 
 // ---------------------------------------------------------------------------
-// Visuals Settings State
+// Features Configuration State
 // ---------------------------------------------------------------------------
 
-// ESP Settings
+// 1. Skateboard ESP
 static bool  g_espEnabled   = true;
 static bool  g_esp3DBox     = true;
 static bool  g_esp2DBox     = false;
@@ -351,14 +358,57 @@ static bool  g_espRainbow   = false;
 static float g_espColor[4]  = { 0.0f, 1.0f, 0.85f, 1.0f };
 static float g_espThickness = 2.0f;
 
-// Skateboard Chams & Glow
-static bool  g_boardGlow        = false;
-static float g_boardBrightness  = 2.5f;
-static bool  g_boardRainbow     = false;
-static bool  g_boardTiltHack    = false;
-static float g_boardTiltAngle   = 45.0f;
+// 2. Real 3D Chams (Skateboard)
+static bool  g_chamsEnabled   = true;
+static bool  g_chamsDeck      = true;
+static bool  g_chamsWheels    = true;
+static bool  g_chamsRainbow   = false;
+static bool  g_chamsWireframe = false;
+static float g_chamsColor[4]  = { 0.0f, 0.95f, 1.0f, 0.70f };
+static float g_chamsWheelCol[4] = { 1.0f, 0.15f, 0.65f, 0.85f };
+static float g_chamsAlpha     = 0.75f;
 
-// Fog & Atmosphere
+// 3. Player / Skater ESP
+static bool  g_skaterEspEnabled = true;
+static bool  g_skaterSkeleton   = true;
+static bool  g_skater3DBox      = true;
+static bool  g_skaterHead       = true;
+static bool  g_skaterTag        = true;
+static bool  g_skaterRainbow    = false;
+static float g_skaterColor[4]   = { 0.95f, 0.35f, 0.95f, 1.0f };
+
+// 4. Rainbow Motion Trails (Tron Ribbon)
+static bool g_trailEnabled  = true;
+static int  g_trailLength   = 35;
+static bool g_trailRainbow  = true;
+
+struct TrailPoint {
+    TA::Vec3 nose;
+    TA::Vec3 tail;
+    TA::Vec3 center;
+    bool valid;
+};
+static const int MAX_TRAIL = 60;
+static TrailPoint g_trail[MAX_TRAIL];
+static int g_trailHead = 0;
+static int g_trailCount = 0;
+
+// 5. Anti-Aim / Spinbot for Skateboard
+// 0: Off, 1: Spinbot 360 (Yaw), 2: HVH Jitter, 3: Helicopter, 4: Chaos Shake
+static int   g_aaMode       = 0;
+static float g_spinbotSpeed = 45.0f;
+static bool  g_spinbotRandom = false;
+
+// 6. Fun Physics & Gravity Hacks
+static bool  g_customGravityEnabled = false;
+static float g_customGravityY       = -2.0f; // Moon gravity by default
+static float g_megaJumpForce        = 13.0f; // Velocity Y boost
+static float g_speedBoostAmount     = 16.0f; // Forward boost
+static bool  g_freezeAir            = false;
+static bool  g_triggerMegaJump      = false;
+static bool  g_triggerSpeedBoost    = false;
+
+// 7. Fog & Atmosphere
 static bool  g_fogEnabled       = false;
 static float g_fogColor[4]      = { 0.04f, 0.05f, 0.12f, 0.40f };
 static float g_fogDensity       = 0.6f;
@@ -408,39 +458,79 @@ static bool WorldToScreen(const TA::Vec3 &worldPos, ImVec2 &outScreen, const ImV
 }
 
 // ---------------------------------------------------------------------------
-// Visual Updates & ESP Render
+// Physics & Anti-Aim Modulations
 // ---------------------------------------------------------------------------
 
-static void UpdateVisualModulations() {
-    // Board Brightness / Glow
-    if (p_g_fSkateBoardBrightness) {
-        *p_g_fSkateBoardBrightness = g_boardGlow ? g_boardBrightness : 1.0f;
-    }
-
-    // Board Visual Tilt / Rotation Hack
-    if (p_g_bSkateboardRenderHack && p_g_fSkateboardRenderHackAngle) {
-        *p_g_bSkateboardRenderHack = g_boardTiltHack ? 1 : 0;
-        if (g_boardTiltHack) {
-            *p_g_fSkateboardRenderHackAngle = g_boardTiltAngle * (3.1415926535f / 180.0f);
+static void UpdatePhysicsModulations() {
+    // 1. Custom Gravity
+    if (p_s_pPhysics && *p_s_pPhysics) {
+        float *pPhys = (float *)(*p_s_pPhysics);
+        if (g_customGravityEnabled) {
+            pPhys[1] = g_customGravityY;
+            pPhys[4] = fabsf(g_customGravityY);
+        } else {
+            pPhys[1] = -9.80665f;
+            pPhys[4] = 9.80665f;
         }
     }
 
-    // Rainbow Board Lighting
-    if (g_boardRainbow && p_g_eCurrentWorld && p_g_pWorldInfo) {
-        static float s_rainbowHue = 0.0f;
-        s_rainbowHue += 0.015f;
-        if (s_rainbowHue > 1.0f) s_rainbowHue -= 1.0f;
-        float r = 1.0f, g = 1.0f, b = 1.0f;
-        ImGui::ColorConvertHSVtoRGB(s_rainbowHue, 1.0f, 1.0f, r, g, b);
-        int curW = *p_g_eCurrentWorld;
-        if (curW >= 0 && curW < 40) {
-            float *lightColor = (float *)(p_g_pWorldInfo + curW * 0x1f0 + 0x144);
-            lightColor[0] = r * (g_boardGlow ? g_boardBrightness : 1.5f);
-            lightColor[1] = g * (g_boardGlow ? g_boardBrightness : 1.5f);
-            lightColor[2] = b * (g_boardGlow ? g_boardBrightness : 1.5f);
-        }
+    // 2. Skateboard Dynamics: Anti-Aim, Jump, Boost, Freeze
+    if (!p_g_pDynamicObjectSkateboard || !*p_g_pDynamicObjectSkateboard) return;
+
+    uint8_t *dynObj = (uint8_t *)*p_g_pDynamicObjectSkateboard;
+    float *angVel = (float *)(dynObj + 0x318); // wx, wy, wz
+    float *linVel = (float *)(dynObj + 0x328); // vx, vy, vz
+    TA::Vec3 *pFwd = (TA::Vec3 *)(dynObj + 0x1e8);
+
+    static int s_aaTick = 0;
+    s_aaTick++;
+
+    // Anti-Aim modes
+    if (g_aaMode == 1) {
+        // Spinbot 360 (Mach-speed yaw rotation)
+        angVel[1] = g_spinbotSpeed;
+    } else if (g_aaMode == 2) {
+        // HVH Jitter (Alternating violent angle flips)
+        angVel[1] = (s_aaTick % 4 < 2) ? g_spinbotSpeed : -g_spinbotSpeed;
+        angVel[0] = (s_aaTick % 6 < 3) ? 22.0f : -22.0f;
+    } else if (g_aaMode == 3) {
+        // Helicopter (Propeller spin + vertical air hover)
+        angVel[1] = 65.0f;
+        if (linVel[1] < 0.6f) linVel[1] = 0.6f;
+    } else if (g_aaMode == 4) {
+        // Chaos Shake
+        angVel[0] = ((rand() % 160) - 80) * 0.5f;
+        angVel[1] = ((rand() % 200) - 100) * 0.6f;
+        angVel[2] = ((rand() % 160) - 80) * 0.5f;
+    }
+
+    // Trigger Mega Jump
+    if (g_triggerMegaJump) {
+        linVel[1] = g_megaJumpForce;
+        g_triggerMegaJump = false;
+    }
+
+    // Trigger Speed Boost
+    if (g_triggerSpeedBoost) {
+        linVel[0] += pFwd->x * g_speedBoostAmount;
+        linVel[2] += pFwd->z * g_speedBoostAmount;
+        g_triggerSpeedBoost = false;
+    }
+
+    // Freeze in Air
+    if (g_freezeAir) {
+        linVel[0] = 0.0f;
+        linVel[1] = 0.0f;
+        linVel[2] = 0.0f;
+        angVel[0] = 0.0f;
+        angVel[1] = 0.0f;
+        angVel[2] = 0.0f;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Render: ESP, 3D Chams, Player ESP, Motion Trails
+// ---------------------------------------------------------------------------
 
 static void DrawVisualsAndESP() {
     ImDrawList *drawList = ImGui::GetBackgroundDrawList();
@@ -457,7 +547,6 @@ static void DrawVisualsAndESP() {
         drawList->AddRectFilled(ImVec2(0, 0), disp, fogCenter);
     }
 
-    if (!g_espEnabled) return;
     if (!p_g_pDynamicObjectSkateboard || !*p_g_pDynamicObjectSkateboard) return;
 
     uint8_t *dynObj = (uint8_t *)*p_g_pDynamicObjectSkateboard;
@@ -477,129 +566,354 @@ static void DrawVisualsAndESP() {
     if (halfLen < 0.20f) halfLen = 0.41f;
     TA::Vec3 boardFwd = (nose - tail).Normalized();
 
-    // Determine ESP Color
-    static float s_espHue = 0.0f;
-    s_espHue += 0.012f;
-    if (s_espHue > 1.0f) s_espHue -= 1.0f;
-    ImU32 espColor;
-    if (g_espRainbow) {
-        float r, g, b;
-        ImGui::ColorConvertHSVtoRGB(s_espHue, 1.0f, 1.0f, r, g, b);
-        espColor = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 1.0f));
-    } else {
-        espColor = ImGui::ColorConvertFloat4ToU32(ImVec4(g_espColor[0], g_espColor[1], g_espColor[2], g_espColor[3]));
-    }
+    static float s_globalHue = 0.0f;
+    s_globalHue += 0.015f;
+    if (s_globalHue > 1.0f) s_globalHue -= 1.0f;
 
-    // 8 Bounding Box Vertices
-    float hw = 0.105f; // half width (0.21m total)
-    float hh = 0.045f; // half height (0.09m total)
-    TA::Vec3 dx = right * hw;
-    TA::Vec3 dy = up * hh;
-    TA::Vec3 dz = boardFwd * halfLen;
-
-    TA::Vec3 boxCorners[8] = {
-        center + dz + dx + dy, // 0: Nose Top Right
-        center + dz - dx + dy, // 1: Nose Top Left
-        center + dz - dx - dy, // 2: Nose Bottom Left
-        center + dz + dx - dy, // 3: Nose Bottom Right
-        center - dz + dx + dy, // 4: Tail Top Right
-        center - dz - dx + dy, // 5: Tail Top Left
-        center - dz - dx - dy, // 6: Tail Bottom Left
-        center - dz + dx - dy  // 7: Tail Bottom Right
-    };
-
-    ImVec2 screenCorners[8];
-    bool cornerVisible[8];
-    int visibleCount = 0;
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-
-    for (int i = 0; i < 8; i++) {
-        cornerVisible[i] = WorldToScreen(boxCorners[i], screenCorners[i], disp);
-        if (cornerVisible[i]) {
-            visibleCount++;
-            if (screenCorners[i].x < minX) minX = screenCorners[i].x;
-            if (screenCorners[i].x > maxX) maxX = screenCorners[i].x;
-            if (screenCorners[i].y < minY) minY = screenCorners[i].y;
-            if (screenCorners[i].y > maxY) maxY = screenCorners[i].y;
+    // -----------------------------------------------------------------------
+    // A. Rainbow Motion Trail (Tron Ribbon)
+    // -----------------------------------------------------------------------
+    if (g_trailEnabled) {
+        // Record new trail point if moved
+        bool record = false;
+        if (g_trailCount == 0) record = true;
+        else {
+            int lastIdx = (g_trailHead - 1 + MAX_TRAIL) % MAX_TRAIL;
+            if ((center - g_trail[lastIdx].center).Length() > 0.035f) record = true;
         }
-    }
 
-    ImVec2 scCenter;
-    bool centerVis = WorldToScreen(center, scCenter, disp);
+        if (record) {
+            g_trail[g_trailHead] = { nose, tail, center, true };
+            g_trailHead = (g_trailHead + 1) % MAX_TRAIL;
+            if (g_trailCount < MAX_TRAIL) g_trailCount++;
+        }
 
-    // 1. Draw 3D Wireframe Box ESP
-    if (g_esp3DBox && visibleCount >= 4) {
-        auto DrawEdge = [&](int i, int j) {
-            if (cornerVisible[i] && cornerVisible[j]) {
-                drawList->AddLine(screenCorners[i], screenCorners[j], espColor, g_espThickness);
+        int count = (g_trailCount > g_trailLength) ? g_trailLength : g_trailCount;
+        for (int i = 0; i < count - 1; i++) {
+            int idx0 = (g_trailHead - count + i + MAX_TRAIL) % MAX_TRAIL;
+            int idx1 = (g_trailHead - count + i + 1 + MAX_TRAIL) % MAX_TRAIL;
+            if (!g_trail[idx0].valid || !g_trail[idx1].valid) continue;
+
+            ImVec2 scNose0, scNose1, scTail0, scTail1;
+            if (WorldToScreen(g_trail[idx0].nose, scNose0, disp) &&
+                WorldToScreen(g_trail[idx1].nose, scNose1, disp) &&
+                WorldToScreen(g_trail[idx0].tail, scTail0, disp) &&
+                WorldToScreen(g_trail[idx1].tail, scTail1, disp)) {
+
+                float progress = (float)i / (float)count;
+                float alpha = progress * 0.75f;
+                float hue = fmodf(s_globalHue + progress * 0.6f, 1.0f);
+                float r, g, b;
+                ImGui::ColorConvertHSVtoRGB(hue, 1.0f, 1.0f, r, g, b);
+
+                ImU32 ribbonCol = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, alpha));
+                drawList->AddQuadFilled(scNose0, scNose1, scTail1, scTail0, ribbonCol);
+                drawList->AddLine(scNose0, scNose1, ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, alpha * 1.2f)), 1.5f);
+                drawList->AddLine(scTail0, scTail1, ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, alpha * 1.2f)), 1.5f);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B. Real 3D Chams (Solid Deck & Wheels Silhouette)
+    // -----------------------------------------------------------------------
+    if (g_chamsEnabled) {
+        float chamsR, chamsG, chamsB;
+        if (g_chamsRainbow) {
+            ImGui::ColorConvertHSVtoRGB(s_globalHue, 1.0f, 1.0f, chamsR, chamsG, chamsB);
+        } else {
+            chamsR = g_chamsColor[0]; chamsG = g_chamsColor[1]; chamsB = g_chamsColor[2];
+        }
+        ImU32 chamsDeckCol = ImGui::ColorConvertFloat4ToU32(ImVec4(chamsR, chamsG, chamsB, g_chamsAlpha));
+        ImU32 chamsLineCol = ImGui::ColorConvertFloat4ToU32(ImVec4(chamsR, chamsG, chamsB, 1.0f));
+
+        float hw = 0.105f;
+        float hh = 0.040f;
+
+        // 8 points defining top deck contour
+        TA::Vec3 deckTop[8] = {
+            center + boardFwd * (halfLen * 0.98f) + up * hh,                 // Nose tip
+            center + boardFwd * (halfLen * 0.82f) + right * hw + up * hh,   // Nose right
+            center + right * hw + up * hh,                                   // Mid right
+            center - boardFwd * (halfLen * 0.82f) + right * hw + up * hh,   // Tail right
+            center - boardFwd * (halfLen * 0.98f) + up * hh,                 // Tail tip
+            center - boardFwd * (halfLen * 0.82f) - right * hw + up * hh,   // Tail left
+            center - right * hw + up * hh,                                   // Mid left
+            center + boardFwd * (halfLen * 0.82f) - right * hw + up * hh    // Nose left
         };
-        // Top Face (Deck outline)
-        DrawEdge(0, 1); DrawEdge(1, 5); DrawEdge(5, 4); DrawEdge(4, 0);
-        // Bottom Face
-        DrawEdge(3, 2); DrawEdge(2, 6); DrawEdge(6, 7); DrawEdge(7, 3);
-        // Connecting Pillars
-        DrawEdge(0, 3); DrawEdge(1, 2); DrawEdge(5, 6); DrawEdge(4, 7);
-        // Top Deck Cross
-        DrawEdge(0, 5); DrawEdge(1, 4);
-    }
 
-    // 2. Draw 2D Box ESP
-    if (g_esp2DBox && visibleCount >= 4) {
-        minX -= 5.0f; maxX += 5.0f;
-        minY -= 5.0f; maxY += 5.0f;
-        // Semi-transparent background
-        drawList->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY),
-                                ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.22f)), 4.0f);
-        // Outline
-        drawList->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), espColor, 4.0f, 0, g_espThickness);
-    }
+        ImVec2 scDeckTop[8];
+        bool allTopVis = true;
+        for (int i = 0; i < 8; i++) {
+            if (!WorldToScreen(deckTop[i], scDeckTop[i], disp)) { allTopVis = false; break; }
+        }
 
-    // 3. Snapline from screen bottom-center to board center
-    if (g_espSnapline && centerVis) {
-        drawList->AddLine(ImVec2(disp.x * 0.5f, disp.y), scCenter,
-                          ImGui::ColorConvertFloat4ToU32(ImVec4(g_espColor[0], g_espColor[1], g_espColor[2], 0.60f)),
-                          1.5f);
-    }
+        if (allTopVis && g_chamsDeck) {
+            if (!g_chamsWireframe) {
+                drawList->AddConvexPolyFilled(scDeckTop, 8, chamsDeckCol);
+            }
+            drawList->AddPolyline(scDeckTop, 8, chamsLineCol, ImDrawFlags_Closed, 2.0f);
+            // Deck centerline
+            drawList->AddLine(scDeckTop[0], scDeckTop[4], chamsLineCol, 1.5f);
+        }
 
-    // 4. Direction / Heading Arrow
-    if (g_espHeading) {
-        TA::Vec3 headWorld = nose + boardFwd * 0.35f;
-        ImVec2 scNose, scHead;
-        if (WorldToScreen(nose, scNose, disp) && WorldToScreen(headWorld, scHead, disp)) {
-            drawList->AddLine(scNose, scHead, ImColor(255, 230, 0, 255), 2.5f);
-            drawList->AddCircleFilled(scHead, 4.0f, ImColor(255, 230, 0, 255));
+        // 4 Wheels Chams
+        if (g_chamsWheels) {
+            TA::Vec3 wheelPos[4] = {
+                center + boardFwd * 0.24f + right * 0.088f - up * 0.048f,
+                center + boardFwd * 0.24f - right * 0.088f - up * 0.048f,
+                center - boardFwd * 0.24f + right * 0.088f - up * 0.048f,
+                center - boardFwd * 0.24f - right * 0.088f - up * 0.048f
+            };
+            ImU32 wheelCol = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(g_chamsWheelCol[0], g_chamsWheelCol[1], g_chamsWheelCol[2], g_chamsWheelCol[3]));
+            ImU32 wheelOut = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(g_chamsWheelCol[0], g_chamsWheelCol[1], g_chamsWheelCol[2], 1.0f));
+
+            for (int w = 0; w < 4; w++) {
+                ImVec2 scW;
+                if (WorldToScreen(wheelPos[w], scW, disp)) {
+                    drawList->AddCircleFilled(scW, 5.5f, wheelCol);
+                    drawList->AddCircle(scW, 6.5f, wheelOut, 12, 1.5f);
+                }
+            }
+            // Axle connecting front & rear wheels
+            ImVec2 scW0, scW1, scW2, scW3;
+            if (WorldToScreen(wheelPos[0], scW0, disp) && WorldToScreen(wheelPos[1], scW1, disp))
+                drawList->AddLine(scW0, scW1, ImColor(220, 220, 220, 200), 2.0f);
+            if (WorldToScreen(wheelPos[2], scW2, disp) && WorldToScreen(wheelPos[3], scW3, disp))
+                drawList->AddLine(scW2, scW3, ImColor(220, 220, 220, 200), 2.0f);
         }
     }
 
-    // 5. Nose & Tail Markers
-    if (g_espNoseTail) {
-        ImVec2 scNose, scTail;
-        if (WorldToScreen(nose, scNose, disp)) {
-            drawList->AddCircleFilled(scNose, 5.0f, ImColor(0, 255, 255, 255));
-            drawList->AddCircle(scNose, 6.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
-            drawList->AddText(ImVec2(scNose.x + 8, scNose.y - 7), ImColor(0, 255, 255, 255), "NOSE");
+    // -----------------------------------------------------------------------
+    // C. Skateboard ESP (3D/2D Box, Snapline, Info HUD)
+    // -----------------------------------------------------------------------
+    if (g_espEnabled) {
+        ImU32 espColor;
+        if (g_espRainbow) {
+            float r, g, b;
+            ImGui::ColorConvertHSVtoRGB(s_globalHue, 1.0f, 1.0f, r, g, b);
+            espColor = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 1.0f));
+        } else {
+            espColor = ImGui::ColorConvertFloat4ToU32(ImVec4(g_espColor[0], g_espColor[1], g_espColor[2], g_espColor[3]));
         }
-        if (WorldToScreen(tail, scTail, disp)) {
-            drawList->AddCircleFilled(scTail, 5.0f, ImColor(255, 60, 60, 255));
-            drawList->AddCircle(scTail, 6.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
-            drawList->AddText(ImVec2(scTail.x + 8, scTail.y - 7), ImColor(255, 60, 60, 255), "TAIL");
+
+        float hw = 0.105f;
+        float hh = 0.045f;
+        TA::Vec3 dx = right * hw;
+        TA::Vec3 dy = up * hh;
+        TA::Vec3 dz = boardFwd * halfLen;
+
+        TA::Vec3 boxCorners[8] = {
+            center + dz + dx + dy, // 0: Nose Top Right
+            center + dz - dx + dy, // 1: Nose Top Left
+            center + dz - dx - dy, // 2: Nose Bottom Left
+            center + dz + dx - dy, // 3: Nose Bottom Right
+            center - dz + dx + dy, // 4: Tail Top Right
+            center - dz - dx + dy, // 5: Tail Top Left
+            center - dz - dx - dy, // 6: Tail Bottom Left
+            center - dz + dx - dy  // 7: Tail Bottom Right
+        };
+
+        ImVec2 screenCorners[8];
+        bool cornerVisible[8];
+        int visibleCount = 0;
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+
+        for (int i = 0; i < 8; i++) {
+            cornerVisible[i] = WorldToScreen(boxCorners[i], screenCorners[i], disp);
+            if (cornerVisible[i]) {
+                visibleCount++;
+                if (screenCorners[i].x < minX) minX = screenCorners[i].x;
+                if (screenCorners[i].x > maxX) maxX = screenCorners[i].x;
+                if (screenCorners[i].y < minY) minY = screenCorners[i].y;
+                if (screenCorners[i].y > maxY) maxY = screenCorners[i].y;
+            }
+        }
+
+        ImVec2 scCenter;
+        bool centerVis = WorldToScreen(center, scCenter, disp);
+
+        // 3D Box ESP
+        if (g_esp3DBox && visibleCount >= 4) {
+            auto DrawEdge = [&](int i, int j) {
+                if (cornerVisible[i] && cornerVisible[j]) {
+                    drawList->AddLine(screenCorners[i], screenCorners[j], espColor, g_espThickness);
+                }
+            };
+            DrawEdge(0, 1); DrawEdge(1, 5); DrawEdge(5, 4); DrawEdge(4, 0);
+            DrawEdge(3, 2); DrawEdge(2, 6); DrawEdge(6, 7); DrawEdge(7, 3);
+            DrawEdge(0, 3); DrawEdge(1, 2); DrawEdge(5, 6); DrawEdge(4, 7);
+            DrawEdge(0, 5); DrawEdge(1, 4);
+        }
+
+        // 2D Box ESP
+        if (g_esp2DBox && visibleCount >= 4) {
+            minX -= 5.0f; maxX += 5.0f;
+            minY -= 5.0f; maxY += 5.0f;
+            drawList->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY),
+                                    ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.22f)), 4.0f);
+            drawList->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), espColor, 4.0f, 0, g_espThickness);
+        }
+
+        // Snapline
+        if (g_espSnapline && centerVis) {
+            drawList->AddLine(ImVec2(disp.x * 0.5f, disp.y), scCenter,
+                              ImGui::ColorConvertFloat4ToU32(ImVec4(g_espColor[0], g_espColor[1], g_espColor[2], 0.60f)),
+                              1.5f);
+        }
+
+        // Heading Arrow
+        if (g_espHeading) {
+            TA::Vec3 headWorld = nose + boardFwd * 0.35f;
+            ImVec2 scNose, scHead;
+            if (WorldToScreen(nose, scNose, disp) && WorldToScreen(headWorld, scHead, disp)) {
+                drawList->AddLine(scNose, scHead, ImColor(255, 230, 0, 255), 2.5f);
+                drawList->AddCircleFilled(scHead, 4.0f, ImColor(255, 230, 0, 255));
+            }
+        }
+
+        // Nose & Tail Markers
+        if (g_espNoseTail) {
+            ImVec2 scNose, scTail;
+            if (WorldToScreen(nose, scNose, disp)) {
+                drawList->AddCircleFilled(scNose, 5.0f, ImColor(0, 255, 255, 255));
+                drawList->AddCircle(scNose, 6.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
+                drawList->AddText(ImVec2(scNose.x + 8, scNose.y - 7), ImColor(0, 255, 255, 255), "NOSE");
+            }
+            if (WorldToScreen(tail, scTail, disp)) {
+                drawList->AddCircleFilled(scTail, 5.0f, ImColor(255, 60, 60, 255));
+                drawList->AddCircle(scTail, 6.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
+                drawList->AddText(ImVec2(scTail.x + 8, scTail.y - 7), ImColor(255, 60, 60, 255), "TAIL");
+            }
+        }
+
+        // Skateboard Info HUD (Speed & Distance)
+        if (g_espInfo && centerVis) {
+            float dist = (center - g_camPos).Length();
+            float speedKmh = vel.Length() * 3.6f;
+            char infoBuf[128];
+            snprintf(infoBuf, sizeof(infoBuf), "%.1f m | %.1f km/h", dist, speedKmh);
+            ImVec2 txtSz = ImGui::CalcTextSize(infoBuf);
+            ImVec2 txtPos = ImVec2(scCenter.x - txtSz.x * 0.5f, (visibleCount >= 4 ? maxY + 6.0f : scCenter.y + 16.0f));
+
+            drawList->AddRectFilled(ImVec2(txtPos.x - 5, txtPos.y - 2),
+                                    ImVec2(txtPos.x + txtSz.x + 5, txtPos.y + txtSz.y + 2),
+                                    ImColor(0, 0, 0, 200), 4.0f);
+            drawList->AddText(txtPos, ImColor(255, 255, 255, 255), infoBuf);
         }
     }
 
-    // 6. Skateboard Info HUD (Speed & Distance)
-    if (g_espInfo && centerVis) {
-        float dist = (center - g_camPos).Length();
-        float speedKmh = vel.Length() * 3.6f;
-        char infoBuf[128];
-        snprintf(infoBuf, sizeof(infoBuf), "%.1f m | %.1f km/h", dist, speedKmh);
-        ImVec2 txtSz = ImGui::CalcTextSize(infoBuf);
-        ImVec2 txtPos = ImVec2(scCenter.x - txtSz.x * 0.5f, (visibleCount >= 4 ? maxY + 6.0f : scCenter.y + 16.0f));
+    // -----------------------------------------------------------------------
+    // D. Player / Skater ESP (Skeleton, 3D Box, Head Marker, Tags)
+    // -----------------------------------------------------------------------
+    if (g_skaterEspEnabled) {
+        ImU32 skaterColor;
+        if (g_skaterRainbow) {
+            float r, g, b;
+            ImGui::ColorConvertHSVtoRGB(fmodf(s_globalHue + 0.5f, 1.0f), 1.0f, 1.0f, r, g, b);
+            skaterColor = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 1.0f));
+        } else {
+            skaterColor = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(g_skaterColor[0], g_skaterColor[1], g_skaterColor[2], g_skaterColor[3]));
+        }
 
-        drawList->AddRectFilled(ImVec2(txtPos.x - 5, txtPos.y - 2),
-                                ImVec2(txtPos.x + txtSz.x + 5, txtPos.y + txtSz.y + 2),
-                                ImColor(0, 0, 0, 200), 4.0f);
-        drawList->AddText(txtPos, ImColor(255, 255, 255, 255), infoBuf);
+        TA::Vec3 boardUp = up.Normalized();
+        TA::Vec3 boardRight = right.Normalized();
+
+        // Skater anatomical joint positions relative to board
+        TA::Vec3 ptHead     = center + boardUp * 1.68f;
+        TA::Vec3 ptNeck     = center + boardUp * 1.48f;
+        TA::Vec3 ptPelvis   = center + boardUp * 0.85f;
+        TA::Vec3 ptLShoulder= center + boardUp * 1.42f - boardRight * 0.20f;
+        TA::Vec3 ptRShoulder= center + boardUp * 1.42f + boardRight * 0.20f;
+        TA::Vec3 ptLHand    = center + boardUp * 1.10f - boardRight * 0.35f;
+        TA::Vec3 ptRHand    = center + boardUp * 1.10f + boardRight * 0.35f;
+        TA::Vec3 ptLKnee    = center + boardFwd * 0.12f - boardRight * 0.10f + boardUp * 0.45f;
+        TA::Vec3 ptRKnee    = center - boardFwd * 0.15f + boardRight * 0.07f + boardUp * 0.45f;
+        TA::Vec3 ptFrontFoot= center + boardFwd * 0.22f - boardRight * 0.08f + boardUp * 0.06f;
+        TA::Vec3 ptBackFoot = center - boardFwd * 0.28f + boardRight * 0.06f + boardUp * 0.06f;
+
+        ImVec2 scHead, scNeck, scPelvis, scLSh, scRSh, scLH, scRH, scLK, scRK, scFF, scBF;
+        bool bHead = WorldToScreen(ptHead, scHead, disp);
+        bool bNeck = WorldToScreen(ptNeck, scNeck, disp);
+        bool bPelvis = WorldToScreen(ptPelvis, scPelvis, disp);
+        bool bLSh = WorldToScreen(ptLShoulder, scLSh, disp);
+        bool bRSh = WorldToScreen(ptRShoulder, scRSh, disp);
+        bool bLH = WorldToScreen(ptLHand, scLH, disp);
+        bool bRH = WorldToScreen(ptRHand, scRH, disp);
+        bool bLK = WorldToScreen(ptLKnee, scLK, disp);
+        bool bRK = WorldToScreen(ptRKnee, scRK, disp);
+        bool bFF = WorldToScreen(ptFrontFoot, scFF, disp);
+        bool bBF = WorldToScreen(ptBackFoot, scBF, disp);
+
+        // Skeleton Lines
+        if (g_skaterSkeleton) {
+            auto Bone = [&](ImVec2 p1, ImVec2 p2, bool v1, bool v2) {
+                if (v1 && v2) drawList->AddLine(p1, p2, skaterColor, 2.0f);
+            };
+            Bone(scHead, scNeck, bHead, bNeck);
+            Bone(scNeck, scPelvis, bNeck, bPelvis);
+            Bone(scNeck, scLSh, bNeck, bLSh);
+            Bone(scNeck, scRSh, bNeck, bRSh);
+            Bone(scLSh, scLH, bLSh, bLH);
+            Bone(scRSh, scRH, bRSh, bRH);
+            Bone(scPelvis, scLK, bPelvis, bLK);
+            Bone(scPelvis, scRK, bPelvis, bRK);
+            Bone(scLK, scFF, bLK, bFF);
+            Bone(scRK, scBF, bRK, bBF);
+        }
+
+        // Head Circle & Marker
+        if (g_skaterHead && bHead) {
+            drawList->AddCircleFilled(scHead, 7.0f, skaterColor);
+            drawList->AddCircle(scHead, 8.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
+        }
+
+        // Skater 3D Box
+        if (g_skater3DBox) {
+            float sHW = 0.30f;
+            float sHL = 0.25f;
+            TA::Vec3 sCenter = center + boardUp * 0.90f;
+            TA::Vec3 sBox[8] = {
+                sCenter + boardUp * 0.90f + boardRight * sHW + boardFwd * sHL,
+                sCenter + boardUp * 0.90f - boardRight * sHW + boardFwd * sHL,
+                sCenter + boardUp * 0.90f - boardRight * sHW - boardFwd * sHL,
+                sCenter + boardUp * 0.90f + boardRight * sHW - boardFwd * sHL,
+                sCenter - boardUp * 0.90f + boardRight * sHW + boardFwd * sHL,
+                sCenter - boardUp * 0.90f - boardRight * sHW + boardFwd * sHL,
+                sCenter - boardUp * 0.90f - boardRight * sHW - boardFwd * sHL,
+                sCenter - boardUp * 0.90f + boardRight * sHW - boardFwd * sHL
+            };
+            ImVec2 scSBox[8];
+            bool sBoxVis[8];
+            int sVisCount = 0;
+            for (int i = 0; i < 8; i++) {
+                sBoxVis[i] = WorldToScreen(sBox[i], scSBox[i], disp);
+                if (sBoxVis[i]) sVisCount++;
+            }
+            if (sVisCount >= 4) {
+                auto SEdge = [&](int i, int j) {
+                    if (sBoxVis[i] && sBoxVis[j])
+                        drawList->AddLine(scSBox[i], scSBox[j], skaterColor, 1.5f);
+                };
+                SEdge(0, 1); SEdge(1, 2); SEdge(2, 3); SEdge(3, 0);
+                SEdge(4, 5); SEdge(5, 6); SEdge(6, 7); SEdge(7, 4);
+                SEdge(0, 4); SEdge(1, 5); SEdge(2, 6); SEdge(3, 7);
+            }
+        }
+
+        // Skater Tag / HUD
+        if (g_skaterTag && bHead) {
+            const char *tagText = "SKATER [RIDER]";
+            ImVec2 tagSz = ImGui::CalcTextSize(tagText);
+            ImVec2 tagPos = ImVec2(scHead.x - tagSz.x * 0.5f, scHead.y - 24.0f);
+            drawList->AddRectFilled(ImVec2(tagPos.x - 4, tagPos.y - 2),
+                                    ImVec2(tagPos.x + tagSz.x + 4, tagPos.y + tagSz.y + 2),
+                                    ImColor(0, 0, 0, 190), 3.0f);
+            drawList->AddText(tagPos, skaterColor, tagText);
+        }
     }
 }
 
@@ -664,13 +978,14 @@ static void InstallHooks() {
         gS.parkKeyHook = (orig_ParkKey != nullptr);
     }
 
-    // Visuals & Camera & Skybox hooks
+    // Camera hook
     void *camSym = FindSymbol("__ZN6Camera17SetViewParametersERfRN2TA4Vec3ES3_");
     if (camSym) {
         MSHookFunction(camSym, (void *)hook_SetViewParameters, (void **)&orig_SetViewParameters);
         gS.camHooked = (orig_SetViewParameters != nullptr);
     }
 
+    // Skybox hook
     void *skySym = FindSymbol("__ZN11SkyHemiCube6RenderEv");
     if (skySym) {
         MSHookFunction(skySym, (void *)hook_SkyHemiCube_Render, (void **)&orig_SkyHemiCube_Render);
@@ -685,6 +1000,10 @@ static void InstallHooks() {
     p_g_pDynamicObjectSkateboard = (void **)FindSymbol("_g_pDynamicObjectSkateboard");
     gS.dynSkateFound = (p_g_pDynamicObjectSkateboard != nullptr);
     p_g_pSkateboard              = (void **)FindSymbol("_g_pSkateboard");
+    p_g_skater                   = FindSymbol("_g_skater");
+    p_s_pPhysics                 = (void **)FindSymbol("__ZN2TA7Physics10s_pPhysicsE");
+    gS.physicsFound              = (p_s_pPhysics != nullptr);
+
     p_g_fSkateBoardBrightness    = (float *)FindSymbol("_g_fSkateBoardBrightness");
     p_g_bSkateboardRenderHack    = (uint8_t *)FindSymbol("_g_bSkateboardRenderHack");
     p_g_fSkateboardRenderHackAngle = (float *)FindSymbol("_g_fSkateboardRenderHackAngle");
@@ -732,14 +1051,13 @@ static void RunSearch(const char *q) {
 static void DrawMenuWindow() {
     g_sliderActive = false;
 
-    // Size and position the window nicely for mobile screens
     ImVec2 disp = ImGui::GetIO().DisplaySize;
     float w = disp.x - 32.0f;
     if (w > 640.0f) w = 640.0f;
     if (w < 280.0f) w = disp.x;
 
-    float h = disp.y * 0.75f;
-    if (h > 540.0f) h = 540.0f;
+    float h = disp.y * 0.78f;
+    if (h > 560.0f) h = 560.0f;
 
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2((disp.x - w) * 0.5f, (disp.y - h) * 0.5f), ImGuiCond_FirstUseEver);
@@ -752,14 +1070,17 @@ static void DrawMenuWindow() {
 
         if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_FittingPolicyScroll |
                                        ImGuiTabBarFlags_TabListPopupButton)) {
-            // TAB: Visuals (ESP, Chams, Camera FOV, Fog)
+
+            // ===============================================================
+            // TAB 1: Visuals (ESP, 3D Chams, Player ESP, Trails, Camera)
+            // ===============================================================
             if (ImGui::BeginTabItem("Visuals")) {
                 ImGui::BeginChild("tab_visuals_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
 
+                // Section: Skateboard ESP
                 if (ImGui::CollapsingHeader("Skateboard ESP", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::Checkbox("Master ESP Toggle", &g_espEnabled);
-                    ImGui::Separator();
+                    ImGui::Checkbox("Master Skateboard ESP", &g_espEnabled);
                     ImGui::Checkbox("3D Bounding Box", &g_esp3DBox);
                     ImGui::SameLine();
                     ImGui::Checkbox("2D Box", &g_esp2DBox);
@@ -773,29 +1094,55 @@ static void DrawMenuWindow() {
                     ImGui::Spacing();
                     ImGui::Checkbox("Rainbow ESP Mode", &g_espRainbow);
                     if (!g_espRainbow) {
-                        ImGui::ColorEdit4("ESP Color", g_espColor, ImGuiColorEditFlags_NoInputs);
+                        ImGui::ColorEdit4("ESP Color##board", g_espColor, ImGuiColorEditFlags_NoInputs);
                     }
-                    ImGui::SliderFloat("Line Thickness", &g_espThickness, 1.0f, 5.0f, "%.1f px");
+                    ImGui::SliderFloat("Line Thickness##board", &g_espThickness, 1.0f, 5.0f, "%.1f px");
                     if (ImGui::IsItemActive()) g_sliderActive = true;
                 }
 
-                if (ImGui::CollapsingHeader("Skateboard Chams & Glow", ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::Checkbox("Skateboard Glow", &g_boardGlow);
+                // Section: Real 3D Chams (Deck & Wheels)
+                if (ImGui::CollapsingHeader("Real 3D Chams (Skateboard)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Enable 3D Chams", &g_chamsEnabled);
+                    ImGui::Checkbox("Deck Solid Chams", &g_chamsDeck);
                     ImGui::SameLine();
-                    ImGui::Checkbox("Rainbow Skateboard", &g_boardRainbow);
+                    ImGui::Checkbox("Wheels Chams", &g_chamsWheels);
+                    ImGui::Checkbox("Wireframe Mode", &g_chamsWireframe);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Rainbow Chams", &g_chamsRainbow);
 
-                    ImGui::SliderFloat("Glow Intensity", &g_boardBrightness, 1.0f, 6.0f, "%.1fx");
+                    if (!g_chamsRainbow) {
+                        ImGui::ColorEdit4("Deck Color", g_chamsColor, ImGuiColorEditFlags_NoInputs);
+                    }
+                    ImGui::ColorEdit4("Wheel Color", g_chamsWheelCol, ImGuiColorEditFlags_NoInputs);
+                    ImGui::SliderFloat("Chams Opacity", &g_chamsAlpha, 0.2f, 1.0f, "%.2f");
                     if (ImGui::IsItemActive()) g_sliderActive = true;
+                }
 
-                    ImGui::Separator();
-                    ImGui::Checkbox("Board Tilt Visual Hack", &g_boardTiltHack);
-                    if (g_boardTiltHack) {
-                        ImGui::SliderFloat("Tilt Angle", &g_boardTiltAngle, -180.0f, 180.0f, "%.0f deg");
-                        if (ImGui::IsItemActive()) g_sliderActive = true;
+                // Section: Player / Skater ESP
+                if (ImGui::CollapsingHeader("Player ESP (Skater)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Enable Skater ESP", &g_skaterEspEnabled);
+                    ImGui::Checkbox("Skeleton Bones", &g_skaterSkeleton);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Skater 3D Box", &g_skater3DBox);
+                    ImGui::Checkbox("Head Marker", &g_skaterHead);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Skater Tag", &g_skaterTag);
+
+                    ImGui::Checkbox("Rainbow Skater ESP", &g_skaterRainbow);
+                    if (!g_skaterRainbow) {
+                        ImGui::ColorEdit4("Skater Color", g_skaterColor, ImGuiColorEditFlags_NoInputs);
                     }
                 }
 
-                if (ImGui::CollapsingHeader("Camera Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
+                // Section: Motion Trails (Tron Ribbon)
+                if (ImGui::CollapsingHeader("Rainbow Motion Trail (Tron Ribbon)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Enable Motion Ribbon", &g_trailEnabled);
+                    ImGui::SliderInt("Trail Length", &g_trailLength, 10, 50);
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+                }
+
+                // Section: Camera Visuals
+                if (ImGui::CollapsingHeader("Camera Visuals")) {
                     ImGui::Checkbox("Custom FOV", &g_customFovEnabled);
                     if (g_customFovEnabled) {
                         ImGui::SliderFloat("FOV", &g_customFov, 45.0f, 140.0f, "%.1f deg");
@@ -809,7 +1156,8 @@ static void DrawMenuWindow() {
                     if (ImGui::IsItemActive()) g_sliderActive = true;
                 }
 
-                if (ImGui::CollapsingHeader("World & Atmosphere", ImGuiTreeNodeFlags_DefaultOpen)) {
+                // Section: World & Atmosphere
+                if (ImGui::CollapsingHeader("World & Atmosphere")) {
                     ImGui::Checkbox("Disable Skybox (Void Sky)", &g_disableSkybox);
                     ImGui::Checkbox("Atmospheric Fog / Vignette", &g_fogEnabled);
                     if (g_fogEnabled) {
@@ -823,42 +1171,70 @@ static void DrawMenuWindow() {
                 ImGui::EndTabItem();
             }
 
-            // TAB: Info
-            if (ImGui::BeginTabItem("Info")) {
-                ImGui::BeginChild("tab_info_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            // ===============================================================
+            // TAB 2: Troll & HVH (Anti-Aim, Spinbot, Mega Jump, Gravity)
+            // ===============================================================
+            if (ImGui::BeginTabItem("Troll / HVH")) {
+                ImGui::BeginChild("tab_troll_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
-                ImGui::Text("FPS: %.0f", ImGui::GetIO().Framerate);
-                ImGui::Separator();
-                ImGui::Text("Camera SetViewParameters: %s", gS.camHooked ? "HOOKED" : "NO");
-                ImGui::Text("DynamicObjectSkateboard:  %s", gS.dynSkateFound ? "FOUND" : "NO");
-                ImGui::Text("Camera captured:          %s", g_camCaptured ? "YES" : "NO");
-                ImGui::Separator();
-                ImGui::Text("Game::OverridePhysicsSettingsFromStats");
-                ImGui::Text("  found : %s   hooked: %s   calls: %d",
-                            gS.physFound ? "yes" : "NO", gS.physHooked ? "yes" : "NO", gS.physCalls);
-                ImGui::Separator();
-                ImGui::Text("TrueCredits:");
-                ImGui::Text("  found: %s   hooked: %s   add: %s",
-                            gS.tcFound ? "y" : "n", gS.tcHooked ? "y" : "n", gS.addTcFound ? "y" : "n");
+
+                if (ImGui::CollapsingHeader("Skateboard Anti-Aim / Spinbot", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const char *aaModes[] = { "Off", "Spinbot 360", "HVH Jitter", "Helicopter", "Chaos Shake" };
+                    ImGui::Combo("Anti-Aim Mode", &g_aaMode, aaModes, IM_ARRAYSIZE(aaModes));
+                    if (g_aaMode > 0) {
+                        ImGui::SliderFloat("Spin Speed", &g_spinbotSpeed, -120.0f, 120.0f, "%.0f rad/s");
+                        if (ImGui::IsItemActive()) g_sliderActive = true;
+                    }
+                    ImGui::TextWrapped("Forces high angular velocity on the board so it spins like a blender!");
+                }
+
+                if (ImGui::CollapsingHeader("Gravity & Flight Hacks", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Custom In-Engine Gravity", &g_customGravityEnabled);
+                    if (g_customGravityEnabled) {
+                        if (ImGui::Button("Moon (-2.0)"))   g_customGravityY = -2.0f;
+                        ImGui::SameLine();
+                        if (ImGui::Button("Zero-G (0.0)"))  g_customGravityY = 0.0f;
+                        ImGui::SameLine();
+                        if (ImGui::Button("Inverted (+9.8)")) g_customGravityY = 9.8f;
+                        ImGui::SameLine();
+                        if (ImGui::Button("Earth (-9.8)")) g_customGravityY = -9.80665f;
+
+                        ImGui::SliderFloat("Gravity Y", &g_customGravityY, -30.0f, 25.0f, "%.1f m/s^2");
+                        if (ImGui::IsItemActive()) g_sliderActive = true;
+                    }
+
+                    ImGui::Separator();
+                    ImGui::Checkbox("Freeze Mid-Air", &g_freezeAir);
+                    ImGui::Spacing();
+
+                    if (ImGui::Button("MEGA JUMP (Launch to Sky!)", ImVec2(-1, 42))) {
+                        g_triggerMegaJump = true;
+                    }
+                    ImGui::SliderFloat("Jump Force", &g_megaJumpForce, 5.0f, 30.0f, "%.1f m/s");
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+
+                    ImGui::Spacing();
+                    if (ImGui::Button("SPEED BOOST (Sonic Push!)", ImVec2(-1, 42))) {
+                        g_triggerSpeedBoost = true;
+                    }
+                    ImGui::SliderFloat("Boost Amount", &g_speedBoostAmount, 5.0f, 40.0f, "%.1f m/s");
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+                }
+
+                if (ImGui::CollapsingHeader("Auto-Grind (Rail Stick)")) {
+                    if (ImGui::Checkbox("Auto-grind (rail stick)", &g_autoGrind))
+                        ApplyGrind(g_autoGrind);
+                    ImGui::Text("  threshold patch sites: %d", g_grindSiteCount);
+                    ImGui::Text("  found: %s", g_grindFound ? "yes" : "NO");
+                }
+
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
-            // TAB: Grind
-            if (ImGui::BeginTabItem("Grind")) {
-                ImGui::BeginChild("tab_grind_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-                TouchScroll();
-                if (ImGui::Checkbox("Auto-grind (rail stick)", &g_autoGrind))
-                    ApplyGrind(g_autoGrind);
-                ImGui::Text("  threshold patch sites: %d", g_grindSiteCount);
-                ImGui::Text("  found: %s", g_grindFound ? "yes" : "NO");
-                ImGui::Spacing();
-                ImGui::TextWrapped("Raises the rail-snap alignment gate so the board sticks to rails easily.");
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-
-            // TAB: Parks
+            // ===============================================================
+            // TAB 3: Parks
+            // ===============================================================
             if (ImGui::BeginTabItem("Parks")) {
                 ImGui::BeginChild("tab_parks_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -874,7 +1250,9 @@ static void DrawMenuWindow() {
                 ImGui::EndTabItem();
             }
 
-            // TAB: SlowMo
+            // ===============================================================
+            // TAB 4: SlowMo
+            // ===============================================================
             if (ImGui::BeginTabItem("SlowMo")) {
                 ImGui::BeginChild("tab_slowmo_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -888,7 +1266,9 @@ static void DrawMenuWindow() {
                 ImGui::EndTabItem();
             }
 
-            // TAB: Sandbox
+            // ===============================================================
+            // TAB 5: Sandbox
+            // ===============================================================
             if (ImGui::BeginTabItem("Sandbox")) {
                 ImGui::BeginChild("tab_sandbox_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -902,7 +1282,9 @@ static void DrawMenuWindow() {
                 ImGui::EndTabItem();
             }
 
-            // TAB: Money
+            // ===============================================================
+            // TAB 6: Money
+            // ===============================================================
             if (ImGui::BeginTabItem("Money")) {
                 ImGui::BeginChild("tab_money_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -925,20 +1307,17 @@ static void DrawMenuWindow() {
                 ImGui::EndTabItem();
             }
 
-            // TAB: Physics
-            if (ImGui::BeginTabItem("Physics")) {
-                ImGui::BeginChild("tab_phys_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-                TouchScroll();
-                ImGui::TextWrapped("Physics values can be adjusted here.");
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-
-            // TAB: Dev
+            // ===============================================================
+            // TAB 7: Dev / Info
+            // ===============================================================
             if (ImGui::BeginTabItem("Dev")) {
                 ImGui::BeginChild("tab_dev_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
-                static const char *presets[] = {"Game::", "Physics", "Skateboard", "Camera", "Unlock", "Trick"};
+                ImGui::Text("FPS: %.0f", ImGui::GetIO().Framerate);
+                ImGui::Text("Camera: %s  Physics: %s  Skateboard: %s",
+                            gS.camHooked ? "Y" : "N", gS.physicsFound ? "Y" : "N", gS.dynSkateFound ? "Y" : "N");
+                ImGui::Separator();
+                static const char *presets[] = {"Game::", "Physics", "Skateboard", "Skater", "Camera", "Trick"};
                 for (int i = 0; i < 6; i++) {
                     if (i) ImGui::SameLine();
                     if (ImGui::Button(presets[i])) RunSearch(presets[i]);
@@ -974,7 +1353,7 @@ static void DrawMenuWindow() {
 }
 
 static void DrawMenu() {
-    UpdateVisualModulations();
+    UpdatePhysicsModulations();
     DrawVisualsAndESP();
 
     if (g_menuOpen) {
@@ -1132,7 +1511,7 @@ static void DrawMenu() {
     self.mtk.clearColor = MTLClearColorMake(0, 0, 0, 0);
     self.mtk.preferredFramesPerSecond = 60;
     self.mtk.delegate = self;
-    self.mtk.hidden = NO;  // Run transparently so ESP renders during gameplay
+    self.mtk.hidden = NO;  // Run transparently so ESP and Chams render during gameplay
     self.mtk.paused = NO;
     [self.view addSubview:self.mtk];
 
@@ -1177,8 +1556,8 @@ static void DrawMenu() {
         io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
         io.AddMouseButtonEvent(0, false);
 
-        // Keep view running if ESP or Fog is active so it draws while playing
-        BOOL needsRender = (g_espEnabled || g_fogEnabled);
+        // Keep view running if visuals/ESP/chams are active so they draw while skating
+        BOOL needsRender = (g_espEnabled || g_chamsEnabled || g_skaterEspEnabled || g_trailEnabled || g_fogEnabled);
         self.mtk.hidden = !needsRender;
         self.mtk.paused = !needsRender;
     }

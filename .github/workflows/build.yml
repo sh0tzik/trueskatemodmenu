@@ -6,28 +6,30 @@ on:
 
 env:
   IMGUI_VERSION: v1.91.5
+  THEOS: /home/runner/theos
 
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
-        run: brew install ldid dpkg make
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl git zstd
+          sudo apt-get install -y libtinfo5 || sudo apt-get install -y libncurses5 || true
+
+      - name: Cache Theos (toolchain + SDKs)
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/theos
+          key: theos-linux-v1
 
       - name: Install Theos
-        run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-
-      - name: Install iOS SDK
-        run: |
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$HOME/sdks"
-          cd "$HOME/sdks"
-          git sparse-checkout set iPhoneOS16.5.sdk
-          mkdir -p "$HOME/theos/sdks"
-          mv iPhoneOS16.5.sdk "$HOME/theos/sdks/"
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
 
       - name: Fetch ImGui
         run: |
@@ -35,7 +37,7 @@ jobs:
           git clone --depth 1 --branch "$IMGUI_VERSION" https://github.com/ocornut/imgui.git vendor/imgui
 
       - name: Build
-        run: gmake package FINALPACKAGE=1
+        run: make package FINALPACKAGE=1
 
       - name: Upload deb
         uses: actions/upload-artifact@v4

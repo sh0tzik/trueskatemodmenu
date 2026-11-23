@@ -22,6 +22,39 @@
 #include "imgui_impl_metal.h"
 
 // ---------------------------------------------------------------------------
+// Math / 3D Geometry primitives
+// ---------------------------------------------------------------------------
+
+namespace TA {
+    struct Vec2 { float x, y; };
+
+    struct Vec3 {
+        float x, y, z;
+        Vec3() : x(0.0f), y(0.0f), z(0.0f) {}
+        Vec3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
+        Vec3 operator+(const Vec3 &o) const { return Vec3(x + o.x, y + o.y, z + o.z); }
+        Vec3 operator-(const Vec3 &o) const { return Vec3(x - o.x, y - o.y, z - o.z); }
+        Vec3 operator*(float s) const { return Vec3(x * s, y * s, z * s); }
+        Vec3 operator/(float s) const { return Vec3(x / s, y / s, z / s); }
+        float Length() const { return sqrtf(x * x + y * y + z * z); }
+        Vec3 Normalized() const {
+            float l = Length();
+            return l > 0.00001f ? (*this) * (1.0f / l) : Vec3(0, 0, 0);
+        }
+        static float Dot(const Vec3 &a, const Vec3 &b) {
+            return a.x * b.x + a.y * b.y + a.z * b.z;
+        }
+        static Vec3 Cross(const Vec3 &a, const Vec3 &b) {
+            return Vec3(
+                a.y * b.z - a.z * b.y,
+                a.z * b.x - a.x * b.z,
+                a.x * b.y - a.y * b.x
+            );
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Symbol resolver: the game binary keeps its symbol table, so we can find
 // functions by (mangled) name at runtime instead of hardcoding offsets.
 // Offsets survive game updates this way.
@@ -100,30 +133,49 @@ static std::vector<SymHit> SearchSymbols(const char *needle, size_t maxHits) {
 }
 
 // ---------------------------------------------------------------------------
-// Hooks
+// Game Function Pointers & Global Variables
+// ---------------------------------------------------------------------------
+
+typedef void (*GetPosition_t)(TA::Vec3 *out, void *self);
+static GetPosition_t p_GetNosePos = nullptr;
+static GetPosition_t p_GetTailPos = nullptr;
+
+typedef void (*ProjectPoint_t)(TA::Vec2 *out, const TA::Vec3 *in);
+static ProjectPoint_t p_ProjectPointToScreen = nullptr;
+
+static void   **p_g_pDynamicObjectSkateboard = nullptr;
+static void   **p_g_pSkateboard              = nullptr;
+static float   *p_g_fSkateBoardBrightness    = nullptr;
+static uint8_t *p_g_bSkateboardRenderHack    = nullptr;
+static float   *p_g_fSkateboardRenderHackAngle = nullptr;
+static int     *p_g_eCurrentWorld            = nullptr;
+static uint8_t *p_g_pWorldInfo               = nullptr;
+
+// ---------------------------------------------------------------------------
+// Hooks State
 // ---------------------------------------------------------------------------
 
 static struct {
-    bool   physFound   = false;
-    bool   physHooked  = false;
-    int    physCalls   = 0;
-    bool   tcFound     = false;   // GetTrueCreditsTotal
-    bool   tcHooked    = false;
-    bool   addTcFound  = false;   // AddTrueCredits
-    bool   subDiyHook  = false;   // IsSubscribedToDIYPlus
-    bool   subCurHook  = false;   // IsCurrentSubscription
-    bool   addTrickHook = false;  // Game::AddTrick
-    bool   trickFlag    = false;  // _g_bTrickWasSlowMo resolved
-    bool   notifHook    = false;  // SlowMoNotification_Update
-    bool   parkOwnHook  = false;  // IsParkOwnedAndIfNotShowPopup
-    bool   parkPurHook  = false;  // IsParkPurchased
-    bool   parkKeyHook  = false;  // IsParkUnlockedWithKey
+    bool physFound     = false;
+    bool physHooked    = false;
+    int  physCalls     = 0;
+    bool tcFound       = false;   // GetTrueCreditsTotal
+    bool tcHooked      = false;
+    bool addTcFound    = false;   // AddTrueCredits
+    bool subDiyHook    = false;   // IsSubscribedToDIYPlus
+    bool subCurHook    = false;   // IsCurrentSubscription
+    bool addTrickHook  = false;   // Game::AddTrick
+    bool trickFlag     = false;   // _g_bTrickWasSlowMo resolved
+    bool notifHook     = false;   // SlowMoNotification_Update
+    bool parkOwnHook   = false;   // IsParkOwnedAndIfNotShowPopup
+    bool parkPurHook   = false;   // IsParkPurchased
+    bool parkKeyHook   = false;   // IsParkUnlockedWithKey
+    bool camHooked     = false;   // Camera::SetViewParameters
+    bool skyHooked     = false;   // SkyHemiCube::Render
+    bool dynSkateFound = false;   // _g_pDynamicObjectSkateboard
 } gS;
 
 // --- Unlock all parks ---
-// Park select gates playability behind ownership checks. Forcing them true opens
-// every park whose data is present (many ship in the bundle). Parks not yet
-// downloaded will still try to fetch from the server on tap.
 static bool g_unlockParks = true;
 
 static bool (*orig_ParkOwned)(void *self, int idx) = nullptr;
@@ -143,11 +195,6 @@ static bool hook_ParkKey(void *self, int key) {
 }
 
 // --- Slow-motion tweaks ---
-// Score void in slow-mo: Game::AddTrick checks _g_bTrickWasSlowMo and, if set,
-// forces the trick's score to 0 (verified in disasm). Clearing the flag right
-// before AddTrick scores the trick normally even though time is still slowed.
-// Hide indicator: SlowMoNotification_Update only animates the on-screen "SLOW MO"
-// popup (no fuel logic), so neutering it hides the indicator in game and replays.
 static bool    g_scoreInSlowMo = true;
 static bool    g_hideSlowMoHud = true;
 static uint8_t *p_bTrickWasSlowMo = nullptr;
@@ -165,8 +212,6 @@ static void hook_SlowMoNotif(float f) {
 }
 
 // --- Sandbox subscription unlock ---
-// The whole Sandbox / Community / DIY content is gated behind these client-side
-// boolean checks. Forcing them true makes the game treat the subscription as active.
 static bool g_forceSub = true;
 
 static bool (*orig_IsSubDIY)(void *self) = nullptr;
@@ -185,16 +230,13 @@ static void (*orig_OverridePhysics)(void *self) = nullptr;
 static void hook_OverridePhysics(void *self) {
     gS.physCalls++;
     orig_OverridePhysics(self);
-    // TODO: tweak physics values here once the field layout is reversed.
 }
 
 // --- Currency (TrueCredits) ---
-// UserDataManagerTrueSkate is a singleton we never get a clean accessor for,
-// so we snatch its 'this' from GetTrueCreditsTotal, which the shop/HUD calls a lot.
 typedef void (*AddTC_t)(void *self, int amount, bool flag);
-static void      *g_pUserData  = nullptr;   // captured instance
+static void      *g_pUserData  = nullptr;
 static AddTC_t    p_AddTC      = nullptr;
-static int        g_lastTC     = -1;        // last read balance, for display
+static int        g_lastTC     = -1;
 
 static int (*orig_GetTC)(void *self) = nullptr;
 static int hook_GetTC(void *self) {
@@ -211,10 +253,6 @@ static bool AddTrueCredits(int amount) {
 }
 
 // --- Auto-grind (code patch) ---
-// The rail-snap gate in Game::LockTail/Nose/OrNoseSlideToRail rejects a lock when an
-// alignment component exceeds 0.99 (built with movz w?,#0x70a4 ; movk w?,#0x3f7d,lsl#16).
-// Raising that threshold to 2.0 (never exceeded) makes the board snap to rails freely.
-// EXPERIMENTAL: if grind gets worse instead, the direction is inverted and we lower it.
 static bool g_autoGrind = true;
 
 struct PatchSite { uint32_t *addr; uint32_t orig; uint32_t patched; };
@@ -232,7 +270,6 @@ static void WriteWord(uint32_t *addr, uint32_t word) {
     sys_icache_invalidate(addr, sizeof(uint32_t));
 }
 
-// Find the movz/movk pair that builds 0.99 (0x3f7d70a4) and record a patch -> 2.0 (0x40000000).
 static void FindGrindThreshold(const char *sym) {
     uint32_t *fn = (uint32_t *)FindSymbol(sym);
     if (!fn) return;
@@ -254,6 +291,321 @@ static void ApplyGrind(bool on) {
     for (int i = 0; i < g_grindSiteCount; i++)
         WriteWord(g_grindSites[i].addr, on ? g_grindSites[i].patched : g_grindSites[i].orig);
 }
+
+// ---------------------------------------------------------------------------
+// Camera & Visuals Hooks
+// ---------------------------------------------------------------------------
+
+static bool  g_customFovEnabled = false;
+static float g_customFov        = 75.0f;
+static float g_camDistMult      = 1.0f;
+static float g_camHeightOffset  = 0.0f;
+
+static TA::Vec3 g_camPos;
+static TA::Vec3 g_camTarget;
+static float    g_camFov = 65.0f;
+static bool     g_camCaptured = false;
+
+static void (*orig_SetViewParameters)(void *self, float *pFov, TA::Vec3 *pPos, TA::Vec3 *pTarget) = nullptr;
+static void hook_SetViewParameters(void *self, float *pFov, TA::Vec3 *pPos, TA::Vec3 *pTarget) {
+    orig_SetViewParameters(self, pFov, pPos, pTarget);
+    if (pFov && pPos && pTarget) {
+        if (g_customFovEnabled) {
+            *pFov = g_customFov;
+        }
+        if (fabsf(g_camDistMult - 1.0f) > 0.01f) {
+            TA::Vec3 dir = *pPos - *pTarget;
+            *pPos = *pTarget + dir * g_camDistMult;
+        }
+        if (fabsf(g_camHeightOffset) > 0.01f) {
+            pPos->y += g_camHeightOffset;
+        }
+
+        g_camFov = *pFov;
+        g_camPos = *pPos;
+        g_camTarget = *pTarget;
+        g_camCaptured = true;
+    }
+}
+
+static bool g_disableSkybox = false;
+static void (*orig_SkyHemiCube_Render)(void *self) = nullptr;
+static void hook_SkyHemiCube_Render(void *self) {
+    if (g_disableSkybox) return;
+    orig_SkyHemiCube_Render(self);
+}
+
+// ---------------------------------------------------------------------------
+// Visuals Settings State
+// ---------------------------------------------------------------------------
+
+// ESP Settings
+static bool  g_espEnabled   = true;
+static bool  g_esp3DBox     = true;
+static bool  g_esp2DBox     = false;
+static bool  g_espSnapline  = true;
+static bool  g_espHeading   = true;
+static bool  g_espNoseTail  = true;
+static bool  g_espInfo      = true;
+static bool  g_espRainbow   = false;
+static float g_espColor[4]  = { 0.0f, 1.0f, 0.85f, 1.0f };
+static float g_espThickness = 2.0f;
+
+// Skateboard Chams & Glow
+static bool  g_boardGlow        = false;
+static float g_boardBrightness  = 2.5f;
+static bool  g_boardRainbow     = false;
+static bool  g_boardTiltHack    = false;
+static float g_boardTiltAngle   = 45.0f;
+
+// Fog & Atmosphere
+static bool  g_fogEnabled       = false;
+static float g_fogColor[4]      = { 0.04f, 0.05f, 0.12f, 0.40f };
+static float g_fogDensity       = 0.6f;
+
+// ---------------------------------------------------------------------------
+// World To Screen Projection
+// ---------------------------------------------------------------------------
+
+static bool WorldToScreen(const TA::Vec3 &worldPos, ImVec2 &outScreen, const ImVec2 &dispSize) {
+    if (!g_camCaptured) return false;
+
+    TA::Vec3 toPt = worldPos - g_camPos;
+    TA::Vec3 camFwd = (g_camTarget - g_camPos).Normalized();
+    float zDist = TA::Vec3::Dot(toPt, camFwd);
+    if (zDist <= 0.08f) return false; // Behind camera clipping
+
+    // 1. Try game's built-in ProjectPointToScreen
+    if (p_ProjectPointToScreen) {
+        TA::Vec2 ndc = { 0.0f, 0.0f };
+        p_ProjectPointToScreen(&ndc, &worldPos);
+        if (ndc.x != 0.0f || ndc.y != 0.0f) {
+            outScreen.x = (ndc.x + 1.0f) * 0.5f * dispSize.x;
+            outScreen.y = (1.0f - ndc.y) * 0.5f * dispSize.y;
+            return true;
+        }
+    }
+
+    // 2. Mathematical camera perspective projection fallback
+    TA::Vec3 worldUp(0.0f, 1.0f, 0.0f);
+    TA::Vec3 camRight = TA::Vec3::Cross(camFwd, worldUp).Normalized();
+    if (camRight.Length() < 0.001f) camRight = TA::Vec3(1.0f, 0.0f, 0.0f);
+    TA::Vec3 camUp = TA::Vec3::Cross(camRight, camFwd).Normalized();
+
+    float viewX = TA::Vec3::Dot(toPt, camRight);
+    float viewY = TA::Vec3::Dot(toPt, camUp);
+
+    float aspect = dispSize.x / (dispSize.y > 0.0f ? dispSize.y : 1.0f);
+    float halfFovRad = (g_camFov * 0.5f) * (3.1415926535f / 180.0f);
+    float tanHalfFov = tanf(halfFovRad);
+
+    float ndcX = viewX / (zDist * tanHalfFov * aspect);
+    float ndcY = viewY / (zDist * tanHalfFov);
+
+    outScreen.x = (ndcX + 1.0f) * 0.5f * dispSize.x;
+    outScreen.y = (1.0f - ndcY) * 0.5f * dispSize.y;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Visual Updates & ESP Render
+// ---------------------------------------------------------------------------
+
+static void UpdateVisualModulations() {
+    // Board Brightness / Glow
+    if (p_g_fSkateBoardBrightness) {
+        *p_g_fSkateBoardBrightness = g_boardGlow ? g_boardBrightness : 1.0f;
+    }
+
+    // Board Visual Tilt / Rotation Hack
+    if (p_g_bSkateboardRenderHack && p_g_fSkateboardRenderHackAngle) {
+        *p_g_bSkateboardRenderHack = g_boardTiltHack ? 1 : 0;
+        if (g_boardTiltHack) {
+            *p_g_fSkateboardRenderHackAngle = g_boardTiltAngle * (3.1415926535f / 180.0f);
+        }
+    }
+
+    // Rainbow Board Lighting
+    if (g_boardRainbow && p_g_eCurrentWorld && p_g_pWorldInfo) {
+        static float s_rainbowHue = 0.0f;
+        s_rainbowHue += 0.015f;
+        if (s_rainbowHue > 1.0f) s_rainbowHue -= 1.0f;
+        float r = 1.0f, g = 1.0f, b = 1.0f;
+        ImGui::ColorConvertHSVtoRGB(s_rainbowHue, 1.0f, 1.0f, r, g, b);
+        int curW = *p_g_eCurrentWorld;
+        if (curW >= 0 && curW < 40) {
+            float *lightColor = (float *)(p_g_pWorldInfo + curW * 0x1f0 + 0x144);
+            lightColor[0] = r * (g_boardGlow ? g_boardBrightness : 1.5f);
+            lightColor[1] = g * (g_boardGlow ? g_boardBrightness : 1.5f);
+            lightColor[2] = b * (g_boardGlow ? g_boardBrightness : 1.5f);
+        }
+    }
+}
+
+static void DrawVisualsAndESP() {
+    ImDrawList *drawList = ImGui::GetBackgroundDrawList();
+    ImVec2 disp = ImGui::GetIO().DisplaySize;
+
+    // Atmospheric Fog / Dark Mood Overlay
+    if (g_fogEnabled) {
+        ImU32 fogEdge = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(g_fogColor[0], g_fogColor[1], g_fogColor[2], g_fogColor[3] * g_fogDensity));
+        ImU32 fogCenter = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(g_fogColor[0], g_fogColor[1], g_fogColor[2], g_fogColor[3] * g_fogDensity * 0.35f));
+
+        drawList->AddRectFilledMultiColor(ImVec2(0, 0), disp, fogEdge, fogEdge, fogCenter, fogCenter);
+        drawList->AddRectFilled(ImVec2(0, 0), disp, fogCenter);
+    }
+
+    if (!g_espEnabled) return;
+    if (!p_g_pDynamicObjectSkateboard || !*p_g_pDynamicObjectSkateboard) return;
+
+    uint8_t *dynObj = (uint8_t *)*p_g_pDynamicObjectSkateboard;
+    TA::Vec3 right = *(TA::Vec3 *)(dynObj + 0x1c8);
+    TA::Vec3 up    = *(TA::Vec3 *)(dynObj + 0x1d8);
+    TA::Vec3 fwd   = *(TA::Vec3 *)(dynObj + 0x1e8);
+    TA::Vec3 pos   = *(TA::Vec3 *)(dynObj + 0x1f8);
+    TA::Vec3 vel   = *(TA::Vec3 *)(dynObj + 0x328);
+
+    TA::Vec3 nose = pos + fwd * 0.41f;
+    TA::Vec3 tail = pos - fwd * 0.41f;
+    if (p_GetNosePos) p_GetNosePos(&nose, dynObj);
+    if (p_GetTailPos) p_GetTailPos(&tail, dynObj);
+
+    TA::Vec3 center = (nose + tail) * 0.5f;
+    float halfLen = (nose - tail).Length() * 0.5f;
+    if (halfLen < 0.20f) halfLen = 0.41f;
+    TA::Vec3 boardFwd = (nose - tail).Normalized();
+
+    // Determine ESP Color
+    static float s_espHue = 0.0f;
+    s_espHue += 0.012f;
+    if (s_espHue > 1.0f) s_espHue -= 1.0f;
+    ImU32 espColor;
+    if (g_espRainbow) {
+        float r, g, b;
+        ImGui::ColorConvertHSVtoRGB(s_espHue, 1.0f, 1.0f, r, g, b);
+        espColor = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 1.0f));
+    } else {
+        espColor = ImGui::ColorConvertFloat4ToU32(ImVec4(g_espColor[0], g_espColor[1], g_espColor[2], g_espColor[3]));
+    }
+
+    // 8 Bounding Box Vertices
+    float hw = 0.105f; // half width (0.21m total)
+    float hh = 0.045f; // half height (0.09m total)
+    TA::Vec3 dx = right * hw;
+    TA::Vec3 dy = up * hh;
+    TA::Vec3 dz = boardFwd * halfLen;
+
+    TA::Vec3 boxCorners[8] = {
+        center + dz + dx + dy, // 0: Nose Top Right
+        center + dz - dx + dy, // 1: Nose Top Left
+        center + dz - dx - dy, // 2: Nose Bottom Left
+        center + dz + dx - dy, // 3: Nose Bottom Right
+        center - dz + dx + dy, // 4: Tail Top Right
+        center - dz - dx + dy, // 5: Tail Top Left
+        center - dz - dx - dy, // 6: Tail Bottom Left
+        center - dz + dx - dy  // 7: Tail Bottom Right
+    };
+
+    ImVec2 screenCorners[8];
+    bool cornerVisible[8];
+    int visibleCount = 0;
+    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+
+    for (int i = 0; i < 8; i++) {
+        cornerVisible[i] = WorldToScreen(boxCorners[i], screenCorners[i], disp);
+        if (cornerVisible[i]) {
+            visibleCount++;
+            if (screenCorners[i].x < minX) minX = screenCorners[i].x;
+            if (screenCorners[i].x > maxX) maxX = screenCorners[i].x;
+            if (screenCorners[i].y < minY) minY = screenCorners[i].y;
+            if (screenCorners[i].y > maxY) maxY = screenCorners[i].y;
+        }
+    }
+
+    ImVec2 scCenter;
+    bool centerVis = WorldToScreen(center, scCenter, disp);
+
+    // 1. Draw 3D Wireframe Box ESP
+    if (g_esp3DBox && visibleCount >= 4) {
+        auto DrawEdge = [&](int i, int j) {
+            if (cornerVisible[i] && cornerVisible[j]) {
+                drawList->AddLine(screenCorners[i], screenCorners[j], espColor, g_espThickness);
+            }
+        };
+        // Top Face (Deck outline)
+        DrawEdge(0, 1); DrawEdge(1, 5); DrawEdge(5, 4); DrawEdge(4, 0);
+        // Bottom Face
+        DrawEdge(3, 2); DrawEdge(2, 6); DrawEdge(6, 7); DrawEdge(7, 3);
+        // Connecting Pillars
+        DrawEdge(0, 3); DrawEdge(1, 2); DrawEdge(5, 6); DrawEdge(4, 7);
+        // Top Deck Cross
+        DrawEdge(0, 5); DrawEdge(1, 4);
+    }
+
+    // 2. Draw 2D Box ESP
+    if (g_esp2DBox && visibleCount >= 4) {
+        minX -= 5.0f; maxX += 5.0f;
+        minY -= 5.0f; maxY += 5.0f;
+        // Semi-transparent background
+        drawList->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY),
+                                ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.22f)), 4.0f);
+        // Outline
+        drawList->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), espColor, 4.0f, 0, g_espThickness);
+    }
+
+    // 3. Snapline from screen bottom-center to board center
+    if (g_espSnapline && centerVis) {
+        drawList->AddLine(ImVec2(disp.x * 0.5f, disp.y), scCenter,
+                          ImGui::ColorConvertFloat4ToU32(ImVec4(g_espColor[0], g_espColor[1], g_espColor[2], 0.60f)),
+                          1.5f);
+    }
+
+    // 4. Direction / Heading Arrow
+    if (g_espHeading) {
+        TA::Vec3 headWorld = nose + boardFwd * 0.35f;
+        ImVec2 scNose, scHead;
+        if (WorldToScreen(nose, scNose, disp) && WorldToScreen(headWorld, scHead, disp)) {
+            drawList->AddLine(scNose, scHead, ImColor(255, 230, 0, 255), 2.5f);
+            drawList->AddCircleFilled(scHead, 4.0f, ImColor(255, 230, 0, 255));
+        }
+    }
+
+    // 5. Nose & Tail Markers
+    if (g_espNoseTail) {
+        ImVec2 scNose, scTail;
+        if (WorldToScreen(nose, scNose, disp)) {
+            drawList->AddCircleFilled(scNose, 5.0f, ImColor(0, 255, 255, 255));
+            drawList->AddCircle(scNose, 6.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
+            drawList->AddText(ImVec2(scNose.x + 8, scNose.y - 7), ImColor(0, 255, 255, 255), "NOSE");
+        }
+        if (WorldToScreen(tail, scTail, disp)) {
+            drawList->AddCircleFilled(scTail, 5.0f, ImColor(255, 60, 60, 255));
+            drawList->AddCircle(scTail, 6.5f, ImColor(0, 0, 0, 220), 12, 1.5f);
+            drawList->AddText(ImVec2(scTail.x + 8, scTail.y - 7), ImColor(255, 60, 60, 255), "TAIL");
+        }
+    }
+
+    // 6. Skateboard Info HUD (Speed & Distance)
+    if (g_espInfo && centerVis) {
+        float dist = (center - g_camPos).Length();
+        float speedKmh = vel.Length() * 3.6f;
+        char infoBuf[128];
+        snprintf(infoBuf, sizeof(infoBuf), "%.1f m | %.1f km/h", dist, speedKmh);
+        ImVec2 txtSz = ImGui::CalcTextSize(infoBuf);
+        ImVec2 txtPos = ImVec2(scCenter.x - txtSz.x * 0.5f, (visibleCount >= 4 ? maxY + 6.0f : scCenter.y + 16.0f));
+
+        drawList->AddRectFilled(ImVec2(txtPos.x - 5, txtPos.y - 2),
+                                ImVec2(txtPos.x + txtSz.x + 5, txtPos.y + txtSz.y + 2),
+                                ImColor(0, 0, 0, 200), 4.0f);
+        drawList->AddText(txtPos, ImColor(255, 255, 255, 255), infoBuf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Installation
+// ---------------------------------------------------------------------------
 
 static void InstallHooks() {
     void *a = FindSymbol("__ZN4Game32OverridePhysicsSettingsFromStatsEv");
@@ -312,6 +664,33 @@ static void InstallHooks() {
         gS.parkKeyHook = (orig_ParkKey != nullptr);
     }
 
+    // Visuals & Camera & Skybox hooks
+    void *camSym = FindSymbol("__ZN6Camera17SetViewParametersERfRN2TA4Vec3ES3_");
+    if (camSym) {
+        MSHookFunction(camSym, (void *)hook_SetViewParameters, (void **)&orig_SetViewParameters);
+        gS.camHooked = (orig_SetViewParameters != nullptr);
+    }
+
+    void *skySym = FindSymbol("__ZN11SkyHemiCube6RenderEv");
+    if (skySym) {
+        MSHookFunction(skySym, (void *)hook_SkyHemiCube_Render, (void **)&orig_SkyHemiCube_Render);
+        gS.skyHooked = (orig_SkyHemiCube_Render != nullptr);
+    }
+
+    // Skateboard positions and dynamic pointers
+    p_GetNosePos = (GetPosition_t)FindSymbol("__ZN2TA23DynamicObjectSkateboard20GetWorldNosePositionEv");
+    p_GetTailPos = (GetPosition_t)FindSymbol("__ZN2TA23DynamicObjectSkateboard20GetWorldTailPositionEv");
+    p_ProjectPointToScreen = (ProjectPoint_t)FindSymbol("__Z20ProjectPointToScreenRKN2TA4Vec3E");
+
+    p_g_pDynamicObjectSkateboard = (void **)FindSymbol("_g_pDynamicObjectSkateboard");
+    gS.dynSkateFound = (p_g_pDynamicObjectSkateboard != nullptr);
+    p_g_pSkateboard              = (void **)FindSymbol("_g_pSkateboard");
+    p_g_fSkateBoardBrightness    = (float *)FindSymbol("_g_fSkateBoardBrightness");
+    p_g_bSkateboardRenderHack    = (uint8_t *)FindSymbol("_g_bSkateboardRenderHack");
+    p_g_fSkateboardRenderHackAngle = (float *)FindSymbol("_g_fSkateboardRenderHackAngle");
+    p_g_eCurrentWorld            = (int *)FindSymbol("_g_eCurrentWorld");
+    p_g_pWorldInfo               = (uint8_t *)FindSymbol("_g_pWorldInfo");
+
     FindGrindThreshold("__ZN4Game25LockTailOrNoseSlideToRailERKN2TA4Vec3Efb");
     FindGrindThreshold("__ZN4Game19LockTailSlideToRailERN2TA4Vec3Eb");
     FindGrindThreshold("__ZN4Game19LockNoseSlideToRailERN2TA4Vec3Eb");
@@ -319,24 +698,26 @@ static void InstallHooks() {
 }
 
 // ---------------------------------------------------------------------------
-// Menu
+// Menu & Touch Interaction
 // ---------------------------------------------------------------------------
 
-static CGRect gMenuRect = CGRectZero;   // points, updated every frame; used for touch passthrough
+static bool   g_menuOpen = false;
+static CGRect gMenuRect = CGRectZero;       // points, updated every frame; used for touch passthrough
+static CGRect gLastMenuRect = CGRectZero;   // remembered while hidden so the first tap after opening lands
 
 // Touch scrolling and gesture arbitration state
 static bool    g_isTouching     = false;
 static bool    g_isScrolling    = false;
-static bool    g_sliderActive   = false;   // don't scroll while manipulating a slider
+static bool    g_sliderActive   = false;
 static CGPoint g_touchStartPos  = CGPointZero;
 static CGPoint g_lastTouchPos   = CGPointZero;
 static float   g_pendingScrollY = 0.0f;
 
-// Call inside a window or child container: scrolls it by finger swipe
 static void TouchScroll() {
     if (!g_isScrolling || g_pendingScrollY == 0.0f) return;
-    if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) return;
+    if (!ImGui::IsWindowHovered()) return;
     ImGui::SetScrollY(ImGui::GetScrollY() - g_pendingScrollY);
+    g_pendingScrollY = 0.0f;
 }
 
 static std::vector<SymHit> gHits;
@@ -348,7 +729,7 @@ static void RunSearch(const char *q) {
     gHits = SearchSymbols(q, 60);
 }
 
-static void DrawMenu() {
+static void DrawMenuWindow() {
     g_sliderActive = false;
 
     // Size and position the window nicely for mobile screens
@@ -357,31 +738,104 @@ static void DrawMenu() {
     if (w > 640.0f) w = 640.0f;
     if (w < 280.0f) w = disp.x;
 
-    float h = disp.y * 0.72f;
-    if (h > 520.0f) h = 520.0f;
+    float h = disp.y * 0.75f;
+    if (h > 540.0f) h = 540.0f;
 
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2((disp.x - w) * 0.5f, (disp.y - h) * 0.5f), ImGuiCond_FirstUseEver);
 
-    // Allow dragging window ONLY by title bar (prevents accidental window drags when swiping content)
     ImGuiWindowFlags winFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar;
 
     if (ImGui::Begin("TrueSkate Mod Menu", nullptr, winFlags)) {
         ImVec2 pos = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
         gMenuRect = CGRectMake(pos.x, pos.y, sz.x, sz.y);
 
-        // Tabs scroll with buttons and popup picker so none get truncated
         if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_FittingPolicyScroll |
                                        ImGuiTabBarFlags_TabListPopupButton)) {
+            // TAB: Visuals (ESP, Chams, Camera FOV, Fog)
+            if (ImGui::BeginTabItem("Visuals")) {
+                ImGui::BeginChild("tab_visuals_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+
+                if (ImGui::CollapsingHeader("Skateboard ESP", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Master ESP Toggle", &g_espEnabled);
+                    ImGui::Separator();
+                    ImGui::Checkbox("3D Bounding Box", &g_esp3DBox);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("2D Box", &g_esp2DBox);
+                    ImGui::Checkbox("Snapline", &g_espSnapline);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Heading Arrow", &g_espHeading);
+                    ImGui::Checkbox("Nose & Tail Points", &g_espNoseTail);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Info HUD (Dist/Speed)", &g_espInfo);
+
+                    ImGui::Spacing();
+                    ImGui::Checkbox("Rainbow ESP Mode", &g_espRainbow);
+                    if (!g_espRainbow) {
+                        ImGui::ColorEdit4("ESP Color", g_espColor, ImGuiColorEditFlags_NoInputs);
+                    }
+                    ImGui::SliderFloat("Line Thickness", &g_espThickness, 1.0f, 5.0f, "%.1f px");
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+                }
+
+                if (ImGui::CollapsingHeader("Skateboard Chams & Glow", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Skateboard Glow", &g_boardGlow);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Rainbow Skateboard", &g_boardRainbow);
+
+                    ImGui::SliderFloat("Glow Intensity", &g_boardBrightness, 1.0f, 6.0f, "%.1fx");
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+
+                    ImGui::Separator();
+                    ImGui::Checkbox("Board Tilt Visual Hack", &g_boardTiltHack);
+                    if (g_boardTiltHack) {
+                        ImGui::SliderFloat("Tilt Angle", &g_boardTiltAngle, -180.0f, 180.0f, "%.0f deg");
+                        if (ImGui::IsItemActive()) g_sliderActive = true;
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Camera Visuals", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Custom FOV", &g_customFovEnabled);
+                    if (g_customFovEnabled) {
+                        ImGui::SliderFloat("FOV", &g_customFov, 45.0f, 140.0f, "%.1f deg");
+                        if (ImGui::IsItemActive()) g_sliderActive = true;
+                    }
+
+                    ImGui::SliderFloat("Camera Distance", &g_camDistMult, 0.4f, 3.0f, "%.2fx");
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+
+                    ImGui::SliderFloat("Camera Height Offset", &g_camHeightOffset, -1.0f, 2.5f, "%.2fm");
+                    if (ImGui::IsItemActive()) g_sliderActive = true;
+                }
+
+                if (ImGui::CollapsingHeader("World & Atmosphere", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Checkbox("Disable Skybox (Void Sky)", &g_disableSkybox);
+                    ImGui::Checkbox("Atmospheric Fog / Vignette", &g_fogEnabled);
+                    if (g_fogEnabled) {
+                        ImGui::SliderFloat("Fog Density", &g_fogDensity, 0.1f, 1.0f, "%.2f");
+                        if (ImGui::IsItemActive()) g_sliderActive = true;
+                        ImGui::ColorEdit4("Fog Color", g_fogColor, ImGuiColorEditFlags_NoInputs);
+                    }
+                }
+
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+
+            // TAB: Info
             if (ImGui::BeginTabItem("Info")) {
                 ImGui::BeginChild("tab_info_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
                 ImGui::Text("FPS: %.0f", ImGui::GetIO().Framerate);
                 ImGui::Separator();
+                ImGui::Text("Camera SetViewParameters: %s", gS.camHooked ? "HOOKED" : "NO");
+                ImGui::Text("DynamicObjectSkateboard:  %s", gS.dynSkateFound ? "FOUND" : "NO");
+                ImGui::Text("Camera captured:          %s", g_camCaptured ? "YES" : "NO");
+                ImGui::Separator();
                 ImGui::Text("Game::OverridePhysicsSettingsFromStats");
-                ImGui::Text("  found : %s", gS.physFound ? "yes" : "NO");
-                ImGui::Text("  hooked: %s", gS.physHooked ? "yes" : "NO");
-                ImGui::Text("  calls : %d", gS.physCalls);
+                ImGui::Text("  found : %s   hooked: %s   calls: %d",
+                            gS.physFound ? "yes" : "NO", gS.physHooked ? "yes" : "NO", gS.physCalls);
                 ImGui::Separator();
                 ImGui::Text("TrueCredits:");
                 ImGui::Text("  found: %s   hooked: %s   add: %s",
@@ -389,6 +843,8 @@ static void DrawMenu() {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: Grind
             if (ImGui::BeginTabItem("Grind")) {
                 ImGui::BeginChild("tab_grind_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -397,62 +853,56 @@ static void DrawMenu() {
                 ImGui::Text("  threshold patch sites: %d", g_grindSiteCount);
                 ImGui::Text("  found: %s", g_grindFound ? "yes" : "NO");
                 ImGui::Spacing();
-                ImGui::TextWrapped("EXPERIMENTAL. Raises the rail-snap alignment gate so the board "
-                                   "sticks to rails easily. If grind behaves worse, tell me and I "
-                                   "flip the value.");
+                ImGui::TextWrapped("Raises the rail-snap alignment gate so the board sticks to rails easily.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: Parks
             if (ImGui::BeginTabItem("Parks")) {
                 ImGui::BeginChild("tab_parks_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
                 ImGui::Checkbox("Unlock all parks", &g_unlockParks);
                 ImGui::Spacing();
                 ImGui::TextWrapped("Forces park ownership checks to true - no purchase popup, "
-                                   "all parks selectable.");
+                                    "all parks selectable.");
                 ImGui::Separator();
                 ImGui::Text("  owned-gate : %s", gS.parkOwnHook ? "yes" : "NO");
                 ImGui::Text("  purchased  : %s", gS.parkPurHook ? "yes" : "NO");
                 ImGui::Text("  key-unlock : %s", gS.parkKeyHook ? "yes" : "NO");
-                ImGui::Separator();
-                ImGui::TextWrapped("Parks bundled in the app open instantly. A park that was never "
-                                   "downloaded will still try to fetch from the server on tap and "
-                                   "may fail without a real purchase.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: SlowMo
             if (ImGui::BeginTabItem("SlowMo")) {
                 ImGui::BeginChild("tab_slowmo_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
                 ImGui::Checkbox("Score counts in slow-mo", &g_scoreInSlowMo);
                 ImGui::TextWrapped("Clears the 'trick was slow-mo' flag so landed tricks give "
-                                   "normal points even while time is slowed.");
-                ImGui::Text("  AddTrick hooked: %s   flag found: %s",
-                            gS.addTrickHook ? "yes" : "NO", gS.trickFlag ? "yes" : "NO");
+                                    "normal points even while time is slowed.");
                 ImGui::Separator();
                 ImGui::Checkbox("Hide slow-mo indicator", &g_hideSlowMoHud);
                 ImGui::TextWrapped("Suppresses the on-screen 'SLOW MO' popup in game and in replays.");
-                ImGui::Text("  Notification hooked: %s", gS.notifHook ? "yes" : "NO");
-                ImGui::Separator();
-                ImGui::TextWrapped("Reminder: keep these runs local - don't post slow-mo scores or "
-                                   "replays to leaderboards.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: Sandbox
             if (ImGui::BeginTabItem("Sandbox")) {
                 ImGui::BeginChild("tab_sandbox_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
                 ImGui::TextWrapped("Unlocks the Sandbox subscription content (Community, DIY, mods) "
-                                   "by forcing the client-side subscription checks to true.");
+                                    "by forcing the client-side subscription checks to true.");
                 ImGui::Separator();
                 ImGui::Checkbox("Force subscription active", &g_forceSub);
                 ImGui::Text("IsSubscribedToDIYPlus hooked: %s", gS.subDiyHook ? "yes" : "NO");
                 ImGui::Text("IsCurrentSubscription hooked: %s", gS.subCurHook ? "yes" : "NO");
-                ImGui::Separator();
-                ImGui::TextWrapped("Toggle off and reopen the menu/form if something behaves oddly.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: Money
             if (ImGui::BeginTabItem("Money")) {
                 ImGui::BeginChild("tab_money_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -465,7 +915,6 @@ static void DrawMenu() {
                 static int amount = 100000;
                 ImGui::SliderInt("amount", &amount, 1000, 1000000);
                 if (ImGui::IsItemActive()) g_sliderActive = true;
-                ImGui::TextWrapped("Keep total sane. Huge values (~2M+) can be clamped or wiped by the game.");
                 ImGui::Spacing();
 
                 bool canAdd = g_pUserData && gS.addTcFound;
@@ -475,14 +924,17 @@ static void DrawMenu() {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: Physics
             if (ImGui::BeginTabItem("Physics")) {
                 ImGui::BeginChild("tab_phys_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
-                ImGui::TextWrapped("Empty for now. Values appear here once stats / physics "
-                                   "structures are reversed (see Dev tab to locate functions).");
+                ImGui::TextWrapped("Physics values can be adjusted here.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
+            // TAB: Dev
             if (ImGui::BeginTabItem("Dev")) {
                 ImGui::BeginChild("tab_dev_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
                 TouchScroll();
@@ -512,17 +964,28 @@ static void DrawMenu() {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+
             ImGui::EndTabBar();
         }
     }
     ImGui::End();
 
-    // Consume pending scroll delta at the end of the frame
     g_pendingScrollY = 0.0f;
 }
 
+static void DrawMenu() {
+    UpdateVisualModulations();
+    DrawVisualsAndESP();
+
+    if (g_menuOpen) {
+        DrawMenuWindow();
+    } else {
+        gMenuRect = CGRectZero;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Overlay window / Metal view
+// Overlay Window & Metal View
 // ---------------------------------------------------------------------------
 
 @interface TSMView : MTKView
@@ -542,51 +1005,44 @@ static void DrawMenu() {
     g_pendingScrollY = 0.0f;
 
     ImGuiIO &io = ImGui::GetIO();
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
     io.AddMousePosEvent((float)p.x, (float)p.y);
     io.AddMouseButtonEvent(0, true);
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *t = touches.anyObject;
-    if (!t) return;
+    if (!t || !g_isTouching) return;
     CGPoint p = [t locationInView:self];
+    ImGuiIO &io = ImGui::GetIO();
 
     float dx = (float)(p.x - g_touchStartPos.x);
     float dy = (float)(p.y - g_touchStartPos.y);
-    float distSq = dx * dx + dy * dy;
 
-    // Threshold of ~10px to recognize swipe vs static tap
-    if (!g_isScrolling && !g_sliderActive && distSq > (10.0f * 10.0f)) {
+    if (!g_isScrolling && !g_sliderActive && fabsf(dy) > 10.0f && fabsf(dy) > fabsf(dx)) {
         g_isScrolling = true;
-        // Cancel mouse button in ImGui so buttons/checkboxes under finger aren't triggered
-        ImGuiIO &io = ImGui::GetIO();
+        io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
         io.AddMouseButtonEvent(0, false);
     }
 
-    if (g_isScrolling) {
-        float deltaY = (float)(p.y - g_lastTouchPos.y);
-        g_pendingScrollY += deltaY;
-    } else {
-        ImGuiIO &io = ImGui::GetIO();
-        io.AddMousePosEvent((float)p.x, (float)p.y);
-    }
+    if (g_isScrolling)
+        g_pendingScrollY += (float)(p.y - g_lastTouchPos.y);
 
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+    io.AddMousePosEvent((float)p.x, (float)p.y);
     g_lastTouchPos = p;
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!g_isTouching) return;
     UITouch *t = touches.anyObject;
     CGPoint p = t ? [t locationInView:self] : g_lastTouchPos;
 
     ImGuiIO &io = ImGui::GetIO();
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
     io.AddMousePosEvent((float)p.x, (float)p.y);
-    if (!g_isScrolling) {
-        // Normal tap completion
-        io.AddMouseButtonEvent(0, false);
-    } else {
-        // Ensure button was released
-        io.AddMouseButtonEvent(0, false);
-    }
+    if (!g_isScrolling) io.AddMouseButtonEvent(0, false);
 
     g_isTouching = false;
     g_isScrolling = false;
@@ -598,18 +1054,9 @@ static void DrawMenu() {
 
 @end
 
-@interface TSMWindow : UIWindow
-@end
+@class TSMController;
 
-@implementation TSMWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *v = [super hitTest:point withEvent:event];
-    if (v == self || v == self.rootViewController.view) return nil;
-    if ([v isKindOfClass:[TSMView class]]) {
-        return CGRectContainsPoint(gMenuRect, point) ? v : nil;
-    }
-    return v;   // the floating toggle button
-}
+@interface TSMWindow : UIWindow
 @end
 
 @interface TSMController : UIViewController <MTKViewDelegate>
@@ -617,6 +1064,25 @@ static void DrawMenu() {
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @property (nonatomic, strong) TSMView *mtk;
 @property (nonatomic, strong) UIButton *toggle;
+- (void)toggleMenu;
+@end
+
+@implementation TSMWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    TSMController *ctrl = (TSMController *)self.rootViewController;
+    if (v == ctrl.toggle) return v;
+    if (v == self || v == ctrl.view) return nil;
+    if ([v isKindOfClass:[TSMView class]]) {
+        // If menu is open and tap is on menu window, let ImGui receive it
+        if (g_menuOpen && CGRectContainsPoint(CGRectInset(gMenuRect, -8, -8), point)) {
+            return v;
+        }
+        // Otherwise pass through to True Skate so gameplay is untouched!
+        return nil;
+    }
+    return v;
+}
 @end
 
 @implementation TSMController
@@ -637,12 +1103,12 @@ static void DrawMenu() {
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.FontGlobalScale = 1.35f;
+    io.ConfigWindowsMoveFromTitleBarOnly = true;
 
     ImGui::StyleColorsDark();
     ImGuiStyle &style = ImGui::GetStyle();
     style.ScaleAllSizes(1.35f);
 
-    // Mobile touch ergonomics
     style.TouchExtraPadding = ImVec2(6.0f, 6.0f);
     style.FramePadding      = ImVec2(10.0f, 8.0f);
     style.ItemSpacing       = ImVec2(10.0f, 10.0f);
@@ -666,8 +1132,8 @@ static void DrawMenu() {
     self.mtk.clearColor = MTLClearColorMake(0, 0, 0, 0);
     self.mtk.preferredFramesPerSecond = 60;
     self.mtk.delegate = self;
-    self.mtk.hidden = YES;
-    self.mtk.paused = YES;
+    self.mtk.hidden = NO;  // Run transparently so ESP renders during gameplay
+    self.mtk.paused = NO;
     [self.view addSubview:self.mtk];
 
     self.toggle = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -696,16 +1162,25 @@ static void DrawMenu() {
 }
 
 - (void)toggleMenu {
-    BOOL show = self.mtk.hidden;
-    self.mtk.hidden = !show;
-    self.mtk.paused = !show;
-    if (!show) {
+    g_menuOpen = !g_menuOpen;
+    if (g_menuOpen) {
+        self.mtk.hidden = NO;
+        self.mtk.paused = NO;
+        gMenuRect = gLastMenuRect;
+    } else {
+        gLastMenuRect = gMenuRect;
         gMenuRect = CGRectZero;
         g_isTouching = false;
         g_isScrolling = false;
         g_pendingScrollY = 0.0f;
         ImGuiIO &io = ImGui::GetIO();
+        io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
         io.AddMouseButtonEvent(0, false);
+
+        // Keep view running if ESP or Fog is active so it draws while playing
+        BOOL needsRender = (g_espEnabled || g_fogEnabled);
+        self.mtk.hidden = !needsRender;
+        self.mtk.paused = !needsRender;
     }
 }
 
@@ -742,7 +1217,7 @@ static void DrawMenu() {
 @end
 
 // ---------------------------------------------------------------------------
-// Entry
+// Entry Point
 // ---------------------------------------------------------------------------
 
 static TSMWindow *gWindow = nil;
@@ -768,9 +1243,9 @@ static void SetupOverlay() {
 __attribute__((constructor))
 static void TSMInit() {
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                      object:nil
-                                                       queue:NSOperationQueue.mainQueue
-                                                  usingBlock:^(NSNotification *) {
+                                                       object:nil
+                                                        queue:NSOperationQueue.mainQueue
+                                                   usingBlock:^(NSNotification *) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ SetupOverlay(); });
     }];

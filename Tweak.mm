@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cmath>
+#include <cfloat>
 
 #include "imgui.h"
 #include "imgui_impl_metal.h"
@@ -321,6 +323,23 @@ static void InstallHooks() {
 // ---------------------------------------------------------------------------
 
 static CGRect gMenuRect = CGRectZero;   // points, updated every frame; used for touch passthrough
+static CGRect gLastMenuRect = CGRectZero;
+
+// Touch scrolling and gesture arbitration state
+static bool    g_isTouching     = false;
+static bool    g_isScrolling    = false;
+static bool    g_sliderActive   = false;   // don't scroll while manipulating a slider
+static CGPoint g_touchStartPos  = CGPointZero;
+static CGPoint g_lastTouchPos   = CGPointZero;
+static float   g_pendingScrollY = 0.0f;
+
+// Call inside a window or child container: scrolls it by finger swipe
+static void TouchScroll() {
+    if (!g_isScrolling || g_pendingScrollY == 0.0f) return;
+    if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) return;
+    ImGui::SetScrollY(ImGui::GetScrollY() - g_pendingScrollY);
+}
+
 static std::vector<SymHit> gHits;
 static std::string gLastQuery;
 static void (^gPromptSearch)(void) = nil;
@@ -331,123 +350,176 @@ static void RunSearch(const char *q) {
 }
 
 static void DrawMenu() {
-    ImGui::SetNextWindowSize(ImVec2(520, 420), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
-    ImGui::Begin("TrueSkate Menu", nullptr, ImGuiWindowFlags_NoCollapse);
+    g_sliderActive = false;
 
-    ImVec2 pos = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
-    gMenuRect = CGRectMake(pos.x, pos.y, sz.x, sz.y);
+    // Size and position the window nicely for mobile screens
+    ImVec2 disp = ImGui::GetIO().DisplaySize;
+    float w = disp.x - 32.0f;
+    if (w > 640.0f) w = 640.0f;
+    if (w < 280.0f) w = disp.x;
 
-    if (ImGui::BeginTabBar("tabs")) {
-        if (ImGui::BeginTabItem("Info")) {
-            ImGui::Text("FPS: %.0f", ImGui::GetIO().Framerate);
-            ImGui::Separator();
-            ImGui::Text("Game::OverridePhysicsSettingsFromStats");
-            ImGui::Text("  found : %s", gS.physFound ? "yes" : "NO");
-            ImGui::Text("  hooked: %s", gS.physHooked ? "yes" : "NO");
-            ImGui::Text("  calls : %d", gS.physCalls);
-            ImGui::Separator();
-            ImGui::Text("TrueCredits  found:%s hooked:%s add:%s",
-                        gS.tcFound ? "y" : "n", gS.tcHooked ? "y" : "n", gS.addTcFound ? "y" : "n");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Grind")) {
-            if (ImGui::Checkbox("Auto-grind (rail stick)", &g_autoGrind))
-                ApplyGrind(g_autoGrind);
-            ImGui::Text("  threshold patch sites: %d", g_grindSiteCount);
-            ImGui::Text("  found: %s", g_grindFound ? "yes" : "NO");
-            ImGui::TextWrapped("EXPERIMENTAL. Raises the rail-snap alignment gate so the board "
-                               "sticks to rails easily. If grind behaves worse, tell me and I "
-                               "flip the value.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Parks")) {
-            ImGui::Checkbox("Unlock all parks", &g_unlockParks);
-            ImGui::TextWrapped("Forces park ownership checks to true - no purchase popup, "
-                               "all parks selectable.");
-            ImGui::Text("  owned-gate : %s", gS.parkOwnHook ? "yes" : "NO");
-            ImGui::Text("  purchased  : %s", gS.parkPurHook ? "yes" : "NO");
-            ImGui::Text("  key-unlock : %s", gS.parkKeyHook ? "yes" : "NO");
-            ImGui::Separator();
-            ImGui::TextWrapped("Parks bundled in the app open instantly. A park that was never "
-                               "downloaded will still try to fetch from the server on tap and "
-                               "may fail without a real purchase.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("SlowMo")) {
-            ImGui::Checkbox("Score counts in slow-mo", &g_scoreInSlowMo);
-            ImGui::TextWrapped("Clears the 'trick was slow-mo' flag so landed tricks give "
-                               "normal points even while time is slowed.");
-            ImGui::Text("  AddTrick hooked: %s   flag found: %s",
-                        gS.addTrickHook ? "yes" : "NO", gS.trickFlag ? "yes" : "NO");
-            ImGui::Separator();
-            ImGui::Checkbox("Hide slow-mo indicator", &g_hideSlowMoHud);
-            ImGui::TextWrapped("Suppresses the on-screen 'SLOW MO' popup in game and in replays.");
-            ImGui::Text("  Notification hooked: %s", gS.notifHook ? "yes" : "NO");
-            ImGui::Separator();
-            ImGui::TextWrapped("Reminder: keep these runs local - don't post slow-mo scores or "
-                               "replays to leaderboards.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Sandbox")) {
-            ImGui::TextWrapped("Unlocks the Sandbox subscription content (Community, DIY, mods) "
-                               "by forcing the client-side subscription checks to true.");
-            ImGui::Separator();
-            ImGui::Checkbox("Force subscription active", &g_forceSub);
-            ImGui::Text("IsSubscribedToDIYPlus hooked: %s", gS.subDiyHook ? "yes" : "NO");
-            ImGui::Text("IsCurrentSubscription hooked: %s", gS.subCurHook ? "yes" : "NO");
-            ImGui::TextWrapped("Toggle off and reopen the menu/form if something behaves oddly.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Money")) {
-            ImGui::Text("TrueCredits balance: %s",
-                        g_lastTC >= 0 ? std::to_string(g_lastTC).c_str() : "(open shop once to read)");
-            ImGui::Text("instance captured: %s", g_pUserData ? "yes" : "NO - open the shop once");
-            ImGui::Text("AddTrueCredits found: %s", gS.addTcFound ? "yes" : "NO");
-            ImGui::Separator();
+    float h = disp.y * 0.72f;
+    if (h > 520.0f) h = 520.0f;
 
-            static int amount = 100000;
-            ImGui::SliderInt("amount", &amount, 1000, 1000000);
-            ImGui::TextWrapped("Keep the total sane. Huge values (~2M+) get clamped or wiped by the game.");
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2((disp.x - w) * 0.5f, (disp.y - h) * 0.5f), ImGuiCond_FirstUseEver);
 
-            bool canAdd = g_pUserData && gS.addTcFound;
-            if (!canAdd) ImGui::BeginDisabled();
-            if (ImGui::Button("Add credits")) AddTrueCredits(amount);
-            if (!canAdd) ImGui::EndDisabled();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Physics")) {
-            ImGui::TextWrapped("Empty for now. Values appear here once the stats / physics "
-                               "structures are reversed (see Dev tab to locate functions).");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Dev")) {
-            static const char *presets[] = {"Game::", "Physics", "Skateboard", "Camera", "Unlock", "Trick"};
-            for (int i = 0; i < 6; i++) {
-                if (i) ImGui::SameLine();
-                if (ImGui::Button(presets[i])) RunSearch(presets[i]);
+    // Allow dragging window ONLY by title bar (prevents accidental window drags when swiping content)
+    ImGuiWindowFlags winFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar;
+
+    if (ImGui::Begin("TrueSkate Mod Menu", nullptr, winFlags)) {
+        ImVec2 pos = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+        gMenuRect = CGRectMake(pos.x, pos.y, sz.x, sz.y);
+
+        // Tabs scroll with buttons and popup picker so none get truncated
+        if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_FittingPolicyScroll |
+                                       ImGuiTabBarFlags_TabListPopupButton)) {
+            if (ImGui::BeginTabItem("Info")) {
+                ImGui::BeginChild("tab_info_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                ImGui::Text("FPS: %.0f", ImGui::GetIO().Framerate);
+                ImGui::Separator();
+                ImGui::Text("Game::OverridePhysicsSettingsFromStats");
+                ImGui::Text("  found : %s", gS.physFound ? "yes" : "NO");
+                ImGui::Text("  hooked: %s", gS.physHooked ? "yes" : "NO");
+                ImGui::Text("  calls : %d", gS.physCalls);
+                ImGui::Separator();
+                ImGui::Text("TrueCredits:");
+                ImGui::Text("  found: %s   hooked: %s   add: %s",
+                            gS.tcFound ? "y" : "n", gS.tcHooked ? "y" : "n", gS.addTcFound ? "y" : "n");
+                ImGui::EndChild();
+                ImGui::EndTabItem();
             }
-            if (ImGui::Button("Custom search...") && gPromptSearch) gPromptSearch();
-            ImGui::SameLine();
-            ImGui::Text("'%s'  (%zu hits)", gLastQuery.c_str(), gHits.size());
-            ImGui::Separator();
-            ImGui::BeginChild("hits", ImVec2(0, 0), true);
-            for (size_t i = 0; i < gHits.size(); i++) {
-                ImGui::PushID((int)i);
-                if (ImGui::SmallButton("copy")) {
-                    UIPasteboard.generalPasteboard.string =
-                        [NSString stringWithFormat:@"0x%llx %s", gHits[i].vmaddr, gHits[i].pretty.c_str()];
+            if (ImGui::BeginTabItem("Grind")) {
+                ImGui::BeginChild("tab_grind_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                if (ImGui::Checkbox("Auto-grind (rail stick)", &g_autoGrind))
+                    ApplyGrind(g_autoGrind);
+                ImGui::Text("  threshold patch sites: %d", g_grindSiteCount);
+                ImGui::Text("  found: %s", g_grindFound ? "yes" : "NO");
+                ImGui::Spacing();
+                ImGui::TextWrapped("EXPERIMENTAL. Raises the rail-snap alignment gate so the board "
+                                   "sticks to rails easily. If grind behaves worse, tell me and I "
+                                   "flip the value.");
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Parks")) {
+                ImGui::BeginChild("tab_parks_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                ImGui::Checkbox("Unlock all parks", &g_unlockParks);
+                ImGui::Spacing();
+                ImGui::TextWrapped("Forces park ownership checks to true - no purchase popup, "
+                                   "all parks selectable.");
+                ImGui::Separator();
+                ImGui::Text("  owned-gate : %s", gS.parkOwnHook ? "yes" : "NO");
+                ImGui::Text("  purchased  : %s", gS.parkPurHook ? "yes" : "NO");
+                ImGui::Text("  key-unlock : %s", gS.parkKeyHook ? "yes" : "NO");
+                ImGui::Separator();
+                ImGui::TextWrapped("Parks bundled in the app open instantly. A park that was never "
+                                   "downloaded will still try to fetch from the server on tap and "
+                                   "may fail without a real purchase.");
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("SlowMo")) {
+                ImGui::BeginChild("tab_slowmo_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                ImGui::Checkbox("Score counts in slow-mo", &g_scoreInSlowMo);
+                ImGui::TextWrapped("Clears the 'trick was slow-mo' flag so landed tricks give "
+                                   "normal points even while time is slowed.");
+                ImGui::Text("  AddTrick hooked: %s   flag found: %s",
+                            gS.addTrickHook ? "yes" : "NO", gS.trickFlag ? "yes" : "NO");
+                ImGui::Separator();
+                ImGui::Checkbox("Hide slow-mo indicator", &g_hideSlowMoHud);
+                ImGui::TextWrapped("Suppresses the on-screen 'SLOW MO' popup in game and in replays.");
+                ImGui::Text("  Notification hooked: %s", gS.notifHook ? "yes" : "NO");
+                ImGui::Separator();
+                ImGui::TextWrapped("Reminder: keep these runs local - don't post slow-mo scores or "
+                                   "replays to leaderboards.");
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Sandbox")) {
+                ImGui::BeginChild("tab_sandbox_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                ImGui::TextWrapped("Unlocks the Sandbox subscription content (Community, DIY, mods) "
+                                   "by forcing the client-side subscription checks to true.");
+                ImGui::Separator();
+                ImGui::Checkbox("Force subscription active", &g_forceSub);
+                ImGui::Text("IsSubscribedToDIYPlus hooked: %s", gS.subDiyHook ? "yes" : "NO");
+                ImGui::Text("IsCurrentSubscription hooked: %s", gS.subCurHook ? "yes" : "NO");
+                ImGui::Separator();
+                ImGui::TextWrapped("Toggle off and reopen the menu/form if something behaves oddly.");
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Money")) {
+                ImGui::BeginChild("tab_money_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                ImGui::Text("TrueCredits balance: %s",
+                            g_lastTC >= 0 ? std::to_string(g_lastTC).c_str() : "(open shop once to read)");
+                ImGui::Text("instance captured: %s", g_pUserData ? "yes" : "NO - open shop once");
+                ImGui::Text("AddTrueCredits found: %s", gS.addTcFound ? "yes" : "NO");
+                ImGui::Separator();
+
+                static int amount = 100000;
+                ImGui::SliderInt("amount", &amount, 1000, 1000000);
+                if (ImGui::IsItemActive()) g_sliderActive = true;
+                ImGui::TextWrapped("Keep total sane. Huge values (~2M+) can be clamped or wiped by the game.");
+                ImGui::Spacing();
+
+                bool canAdd = g_pUserData && gS.addTcFound;
+                if (!canAdd) ImGui::BeginDisabled();
+                if (ImGui::Button("Add credits", ImVec2(-1, 44))) AddTrueCredits(amount);
+                if (!canAdd) ImGui::EndDisabled();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Physics")) {
+                ImGui::BeginChild("tab_phys_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                ImGui::TextWrapped("Empty for now. Values appear here once stats / physics "
+                                   "structures are reversed (see Dev tab to locate functions).");
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Dev")) {
+                ImGui::BeginChild("tab_dev_scroll", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                TouchScroll();
+                static const char *presets[] = {"Game::", "Physics", "Skateboard", "Camera", "Unlock", "Trick"};
+                for (int i = 0; i < 6; i++) {
+                    if (i) ImGui::SameLine();
+                    if (ImGui::Button(presets[i])) RunSearch(presets[i]);
                 }
+                ImGui::Spacing();
+                if (ImGui::Button("Custom search...", ImVec2(160, 36)) && gPromptSearch) gPromptSearch();
                 ImGui::SameLine();
-                ImGui::TextWrapped("0x%llx  %s", gHits[i].vmaddr, gHits[i].pretty.c_str());
-                ImGui::PopID();
+                ImGui::Text("'%s' (%zu hits)", gLastQuery.c_str(), gHits.size());
+                ImGui::Separator();
+                ImGui::BeginChild("hits", ImVec2(0, 240), true);
+                for (size_t i = 0; i < gHits.size(); i++) {
+                    ImGui::PushID((int)i);
+                    if (ImGui::SmallButton("copy")) {
+                        UIPasteboard.generalPasteboard.string =
+                            [NSString stringWithFormat:@"0x%llx %s", gHits[i].vmaddr, gHits[i].pretty.c_str()];
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextWrapped("0x%llx  %s", gHits[i].vmaddr, gHits[i].pretty.c_str());
+                    ImGui::PopID();
+                }
+                TouchScroll();
+                ImGui::EndChild();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
             }
-            ImGui::EndChild();
-            ImGui::EndTabItem();
+            ImGui::EndTabBar();
         }
-        ImGui::EndTabBar();
     }
     ImGui::End();
+
+    // Consume pending scroll delta at the end of the frame
+    g_pendingScrollY = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,19 +530,73 @@ static void DrawMenu() {
 @end
 
 @implementation TSMView
-- (void)feed:(NSSet<UITouch *> *)touches down:(int)state {
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *t = touches.anyObject;
     if (!t) return;
     CGPoint p = [t locationInView:self];
+
+    g_isTouching = true;
+    g_isScrolling = false;
+    g_touchStartPos = p;
+    g_lastTouchPos = p;
+    g_pendingScrollY = 0.0f;
+
     ImGuiIO &io = ImGui::GetIO();
     io.AddMousePosEvent((float)p.x, (float)p.y);
-    if (state == 1) io.AddMouseButtonEvent(0, true);
-    if (state == 2) io.AddMouseButtonEvent(0, false);
+    io.AddMouseButtonEvent(0, true);
 }
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [self feed:t down:1]; }
-- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [self feed:t down:0]; }
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e     { [self feed:t down:2]; }
-- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self feed:t down:2]; }
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = touches.anyObject;
+    if (!t) return;
+    CGPoint p = [t locationInView:self];
+
+    float dx = (float)(p.x - g_touchStartPos.x);
+    float dy = (float)(p.y - g_touchStartPos.y);
+    float distSq = dx * dx + dy * dy;
+
+    // Threshold of ~10px to recognize swipe vs static tap
+    if (!g_isScrolling && !g_sliderActive && distSq > (10.0f * 10.0f)) {
+        g_isScrolling = true;
+        // Cancel mouse button in ImGui so buttons/checkboxes under finger aren't triggered
+        ImGuiIO &io = ImGui::GetIO();
+        io.AddMouseButtonEvent(0, false);
+    }
+
+    if (g_isScrolling) {
+        float deltaY = (float)(p.y - g_lastTouchPos.y);
+        g_pendingScrollY += deltaY;
+    } else {
+        ImGuiIO &io = ImGui::GetIO();
+        io.AddMousePosEvent((float)p.x, (float)p.y);
+    }
+
+    g_lastTouchPos = p;
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = touches.anyObject;
+    CGPoint p = t ? [t locationInView:self] : g_lastTouchPos;
+
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddMousePosEvent((float)p.x, (float)p.y);
+    if (!g_isScrolling) {
+        // Normal tap completion
+        io.AddMouseButtonEvent(0, false);
+    } else {
+        // Ensure button was released
+        io.AddMouseButtonEvent(0, false);
+    }
+
+    g_isTouching = false;
+    g_isScrolling = false;
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self touchesEnded:touches withEvent:event];
+}
+
 @end
 
 @interface TSMWindow : UIWindow
@@ -511,9 +637,26 @@ static void DrawMenu() {
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.FontGlobalScale = 1.5f;
+    io.FontGlobalScale = 1.35f;
+
     ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(1.5f);
+    ImGuiStyle &style = ImGui::GetStyle();
+    style.ScaleAllSizes(1.35f);
+
+    // Mobile touch ergonomics
+    style.TouchExtraPadding = ImVec2(6.0f, 6.0f);
+    style.FramePadding      = ImVec2(10.0f, 8.0f);
+    style.ItemSpacing       = ImVec2(10.0f, 10.0f);
+    style.ItemInnerSpacing  = ImVec2(8.0f, 6.0f);
+    style.ScrollbarSize     = 24.0f;
+    style.GrabMinSize       = 24.0f;
+    style.WindowRounding    = 10.0f;
+    style.FrameRounding     = 6.0f;
+    style.GrabRounding      = 6.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.WindowBorderSize  = 1.0f;
+    style.FrameBorderSize   = 0.5f;
+
     ImGui_ImplMetal_Init(self.device);
 
     self.mtk = [[TSMView alloc] initWithFrame:self.view.bounds device:self.device];
@@ -557,7 +700,14 @@ static void DrawMenu() {
     BOOL show = self.mtk.hidden;
     self.mtk.hidden = !show;
     self.mtk.paused = !show;
-    if (!show) gMenuRect = CGRectZero;
+    if (!show) {
+        gMenuRect = CGRectZero;
+        g_isTouching = false;
+        g_isScrolling = false;
+        g_pendingScrollY = 0.0f;
+        ImGuiIO &io = ImGui::GetIO();
+        io.AddMouseButtonEvent(0, false);
+    }
 }
 
 - (void)dragToggle:(UIPanGestureRecognizer *)g {

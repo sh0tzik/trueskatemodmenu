@@ -1,0 +1,9 @@
+Package: com.example.trueskatemenu
+Name: TrueSkateMenu
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: ImGui mod menu for True Skate (offline use)
+Maintainer: modder
+Author: modder
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 15.0)

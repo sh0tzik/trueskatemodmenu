@@ -101,7 +101,32 @@ static struct {
     bool   addTcFound  = false;   // AddTrueCredits
     bool   subDiyHook  = false;   // IsSubscribedToDIYPlus
     bool   subCurHook  = false;   // IsCurrentSubscription
+    bool   addTrickHook = false;  // Game::AddTrick
+    bool   trickFlag    = false;  // _g_bTrickWasSlowMo resolved
+    bool   notifHook    = false;  // SlowMoNotification_Update
 } gS;
+
+// --- Slow-motion tweaks ---
+// Score void in slow-mo: Game::AddTrick checks _g_bTrickWasSlowMo and, if set,
+// forces the trick's score to 0 (verified in disasm). Clearing the flag right
+// before AddTrick scores the trick normally even though time is still slowed.
+// Hide indicator: SlowMoNotification_Update only animates the on-screen "SLOW MO"
+// popup (no fuel logic), so neutering it hides the indicator in game and replays.
+static bool    g_scoreInSlowMo = true;
+static bool    g_hideSlowMoHud = true;
+static uint8_t *p_bTrickWasSlowMo = nullptr;
+
+static int (*orig_AddTrick)(void *self, int id) = nullptr;
+static int hook_AddTrick(void *self, int id) {
+    if (g_scoreInSlowMo && p_bTrickWasSlowMo) *p_bTrickWasSlowMo = 0;
+    return orig_AddTrick(self, id);
+}
+
+static void (*orig_SlowMoNotif)(float f) = nullptr;
+static void hook_SlowMoNotif(float f) {
+    if (g_hideSlowMoHud) return;
+    orig_SlowMoNotif(f);
+}
 
 // --- Sandbox subscription unlock ---
 // The whole Sandbox / Community / DIY content is gated behind these client-side
@@ -176,6 +201,19 @@ static void InstallHooks() {
         MSHookFunction(s2, (void *)hook_IsCurSub, (void **)&orig_IsCurSub);
         gS.subCurHook = (orig_IsCurSub != nullptr);
     }
+
+    p_bTrickWasSlowMo = (uint8_t *)FindSymbol("_g_bTrickWasSlowMo");
+    gS.trickFlag = (p_bTrickWasSlowMo != nullptr);
+    void *at = FindSymbol("__ZN4Game8AddTrickEi");
+    if (at) {
+        MSHookFunction(at, (void *)hook_AddTrick, (void **)&orig_AddTrick);
+        gS.addTrickHook = (orig_AddTrick != nullptr);
+    }
+    void *sn = FindSymbol("__Z25SlowMoNotification_Updatef");
+    if (sn) {
+        MSHookFunction(sn, (void *)hook_SlowMoNotif, (void **)&orig_SlowMoNotif);
+        gS.notifHook = (orig_SlowMoNotif != nullptr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +249,21 @@ static void DrawMenu() {
             ImGui::Separator();
             ImGui::Text("TrueCredits  found:%s hooked:%s add:%s",
                         gS.tcFound ? "y" : "n", gS.tcHooked ? "y" : "n", gS.addTcFound ? "y" : "n");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("SlowMo")) {
+            ImGui::Checkbox("Score counts in slow-mo", &g_scoreInSlowMo);
+            ImGui::TextWrapped("Clears the 'trick was slow-mo' flag so landed tricks give "
+                               "normal points even while time is slowed.");
+            ImGui::Text("  AddTrick hooked: %s   flag found: %s",
+                        gS.addTrickHook ? "yes" : "NO", gS.trickFlag ? "yes" : "NO");
+            ImGui::Separator();
+            ImGui::Checkbox("Hide slow-mo indicator", &g_hideSlowMoHud);
+            ImGui::TextWrapped("Suppresses the on-screen 'SLOW MO' popup in game and in replays.");
+            ImGui::Text("  Notification hooked: %s", gS.notifHook ? "yes" : "NO");
+            ImGui::Separator();
+            ImGui::TextWrapped("Reminder: keep these runs local - don't post slow-mo scores or "
+                               "replays to leaderboards.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Sandbox")) {
